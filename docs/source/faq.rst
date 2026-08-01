@@ -49,6 +49,31 @@ further I/O immediately::
     be portable to other VISA backends.
 
 
+Are service requests (SRQ) supported?
+-------------------------------------
+
+Yes, for TCPIP INSTR resources — both VXI-11 and HiSLIP. Enable the event and
+then either wait on it or install a handler::
+
+    import pyvisa
+    from pyvisa import constants
+
+    rm = pyvisa.ResourceManager('@py')
+    inst = rm.open_resource('TCPIP::192.168.1.100::hislip0::INSTR')
+
+    inst.enable_event(constants.EventType.service_request, constants.EventMechanism.queue)
+    inst.write('*SRE 16')
+    inst.write('*IDN?')
+    inst.wait_on_event(constants.EventType.service_request, 5000)
+    print(inst.read_stb())
+
+For HiSLIP the status byte travels with the service request itself, so no
+status query is issued behind your back — read it with ``read_stb()`` when you
+need it.
+
+The other transports (GPIB, USBTMC, serial) do not support events yet.
+
+
 Why are you developing this?
 ----------------------------
 

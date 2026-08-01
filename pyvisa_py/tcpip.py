@@ -22,7 +22,8 @@ from pyvisa import attributes, constants, errors, rname
 from pyvisa.constants import BufferOperation, ResourceAttribute, StatusCode
 from pyvisa.typing import VISAJobID
 
-from .common import LOGGER, int_to_byte
+from .common import LOGGER, int_to_byte, set_keepalive
+from .events import EventContext
 from .protocols import hislip, rpc, vxi11
 from .sessions import OpenError, Session, UnknownAttribute, VISARMSession
 
@@ -104,6 +105,30 @@ class TCPIPInstrSession(Session):
         )
 
 
+#: Conversion between VISA REN line operations and HiSLIP remote/local control
+#: requests.  The HiSLIP control codes were defined to mirror the VISA
+#: operations, so this is a one-to-one mapping.
+HISLIP_REMOTE_LOCAL_CONTROL = {
+    constants.RENLineOperation.deassert: "disableRemote",
+    constants.RENLineOperation.asrt: "enableRemote",
+    constants.RENLineOperation.deassert_gtl: "disableAndGTL",
+    constants.RENLineOperation.asrt_address: "enableAndGotoRemote",
+    constants.RENLineOperation.asrt_llo: "enableAndLockoutLocal",
+    constants.RENLineOperation.asrt_address_llo: "enableAndGTRLLO",
+    constants.RENLineOperation.address_gtl: "justGTL",
+}
+
+
+#: Conversion between HiSLIP AsyncLockResponse control codes and VISA status.
+HISLIP_LOCK_ERRORS_TO_VISA = {
+    "success": StatusCode.success,
+    "success shared": StatusCode.success,
+    # The server ran out of patience waiting for the lock to be released.
+    "failure": StatusCode.error_timeout,
+    "error": StatusCode.error_system_error,
+}
+
+
 class TCPIPInstrHiSLIP(Session):
     """A TCPIP Session built on socket standard library using HiSLIP protocol."""
 
@@ -111,6 +136,8 @@ class TCPIPInstrHiSLIP(Session):
     # want it to be registered in the _session_classes array, but we still
     # need to define session_type to make the set_attribute machinery work.
     session_type = (constants.InterfaceType.tcpip, "INSTR")
+
+    _supported_event_types = {constants.EventType.service_request}
 
     # Override parsed to take into account the fact that this class is only used
     # for a specific kind of resource
@@ -140,14 +167,16 @@ class TCPIPInstrHiSLIP(Session):
             sub_address = self.parsed.lan_device_name
             port = 4880
 
+        # Bytes read past a termination character, held back for the next read.
+        self._pending_buffer = bytearray()
+        self._lock_state = constants.VI_NO_LOCK
+
         try:
             self.interface = hislip.Instrument(
                 self.parsed.host_address,
-                open_timeout=(
-                    self.open_timeout * 1000.0
-                    if self.open_timeout is not None
-                    else self.open_timeout
-                ),
+                # ``open_timeout`` is already in milliseconds, which is what
+                # hislip.Instrument expects.
+                open_timeout=self.open_timeout,
                 timeout=self.timeout,
                 port=port,
                 sub_address=sub_address,
@@ -168,7 +197,6 @@ class TCPIPInstrHiSLIP(Session):
         self.attrs[ResourceAttribute.read_buffer_operation_mode] = (
             constants.VI_FLUSH_DISABLE
         )
-        self.attrs[ResourceAttribute.resource_lock_state] = constants.VI_NO_LOCK
         self.attrs[ResourceAttribute.send_end_enabled] = constants.VI_TRUE
         self.attrs[ResourceAttribute.suppress_end_enabled] = constants.VI_FALSE
         self.attrs[ResourceAttribute.tcpip_address] = self.parsed.host_address
@@ -193,6 +221,10 @@ class TCPIPInstrHiSLIP(Session):
         self.attrs[ResourceAttribute.tcpip_keepalive] = (
             self.get_keepalive,
             self.set_keepalive,
+        )
+        self.attrs[ResourceAttribute.resource_lock_state] = (
+            self.get_lock_state,
+            None,
         )
 
         # TODO: additional attributes (someday)
@@ -237,10 +269,49 @@ class TCPIPInstrHiSLIP(Session):
         self.interface.keepalive = keepalive
         return StatusCode.success
 
+    def get_lock_state(self, attribute: ResourceAttribute) -> Tuple[int, StatusCode]:
+        """Current lock state of this session."""
+        return self._lock_state, StatusCode.success
+
     def close(self) -> StatusCode:
+        self._stop_event_monitor()
         self.interface.close()
         self.interface = None
         return StatusCode.success
+
+    def _start_event_monitor(self) -> StatusCode:
+        """Route HiSLIP service requests to the VISA event machinery.
+
+        The asynchronous channel already has a thread reading it, so enabling
+        events is just a matter of registering a callback on it.
+
+        """
+        self._event_state.stop_flag.clear()
+        self.interface.set_srq_callback(self._handle_service_request)
+        return StatusCode.success
+
+    def _stop_event_monitor(self) -> None:
+        """Stop delivering service requests as VISA events."""
+        self._event_state.stop_flag.set()
+        if self.interface is not None:
+            try:
+                self.interface.set_srq_callback(None)
+            except Exception:
+                LOGGER.exception("Error disabling HiSLIP service requests")
+
+    def _handle_service_request(self, status_byte: int) -> None:
+        """Called from the async channel thread on AsyncServiceRequest.
+
+        The status byte travels with the service request itself, so unlike
+        VXI-11 there is no need to poll the instrument from here.
+
+        """
+        if self._event_state.stop_flag.is_set():
+            return
+        self._fire_event(
+            constants.EventType.service_request,
+            EventContext(event_type=constants.EventType.service_request),
+        )
 
     def _set_timeout(self, attribute: ResourceAttribute, value: int) -> StatusCode:
         status = super()._set_timeout(attribute, value)
@@ -267,26 +338,61 @@ class TCPIPInstrHiSLIP(Session):
             Return value of the library call.
 
         """
+        term_char, _ = self.get_attribute(ResourceAttribute.termchar)
+        term_char_en, _ = self.get_attribute(ResourceAttribute.termchar_enabled)
+        term_byte = (
+            int_to_byte(term_char) if term_char_en and term_char is not None else b""
+        )
+
+        # Anything held back by a previous termination-character read is
+        # served first, without touching the wire.
+        if self._pending_buffer:
+            return self._take_pending(count, term_byte)
+
         try:
             data = self.interface.receive(count)
-            status = (
-                StatusCode.success_termination_character_read
-                if self.interface._rmt
-                else StatusCode.success_max_count_read
-                if len(data) >= count
-                else StatusCode.success
-            )
 
         except hislip.HiSLIPInterruptedError:
             # terminate() was called from another thread.  Reset the HiSLIP
             # protocol state so the session is ready for further I/O.
+            self._pending_buffer.clear()
             self.interface.complete_terminate()
-            data, status = b"", StatusCode.error_abort
+            return b"", StatusCode.error_abort
 
         except socket.timeout:
-            data, status = b"", StatusCode.error_timeout
+            return b"", StatusCode.error_timeout
 
-        return data, status
+        except hislip.HiSLIPConnectionLost:
+            LOGGER.exception("HiSLIP connection lost while reading")
+            return b"", StatusCode.error_connection_lost
+
+        except OSError:
+            LOGGER.exception("Failed to read from the HiSLIP connection")
+            return b"", StatusCode.error_io
+
+        if term_byte and term_byte in data:
+            self._pending_buffer.extend(data)
+            return self._take_pending(count, term_byte)
+
+        if len(data) >= count:
+            return data, StatusCode.success_max_count_read
+
+        # A DataEND message is the HiSLIP equivalent of the END indicator.
+        return data, StatusCode.success
+
+    def _take_pending(self, count: int, term_byte: bytes) -> Tuple[bytes, StatusCode]:
+        """Serve a read from the buffer left over by a previous read."""
+        index = self._pending_buffer.find(term_byte) + 1 if term_byte else 0
+        if index > 0 and index <= count:
+            status = StatusCode.success_termination_character_read
+        elif len(self._pending_buffer) >= count:
+            index, status = count, StatusCode.success_max_count_read
+        else:
+            index, status = len(self._pending_buffer), StatusCode.success
+
+        out = bytes(self._pending_buffer[:index])
+        del self._pending_buffer[:index]
+        return out, status
 
     def write(self, data: bytes) -> Tuple[int, StatusCode]:
         """Writes data to device or interface synchronously.
@@ -306,7 +412,18 @@ class TCPIPInstrHiSLIP(Session):
             Return value of the library call.
 
         """
-        self.interface.send(data)
+        send_end, _ = self.get_attribute(ResourceAttribute.send_end_enabled)
+
+        try:
+            self.interface.send(data, end=bool(send_end))
+        except socket.timeout:
+            return 0, StatusCode.error_timeout
+        except hislip.HiSLIPConnectionLost:
+            LOGGER.exception("HiSLIP connection lost while writing")
+            return 0, StatusCode.error_connection_lost
+        except OSError:
+            LOGGER.exception("Failed to write to the HiSLIP connection")
+            return 0, StatusCode.error_io
 
         return len(data), StatusCode.success
 
@@ -316,8 +433,204 @@ class TCPIPInstrHiSLIP(Session):
         Corresponds to viClear function of the VISA library.
 
         """
+        self._pending_buffer.clear()
         self.interface.device_clear()
 
+        return StatusCode.success
+
+    def flush(self, mask: BufferOperation) -> StatusCode:
+        """Flush the specified buffers.
+
+        Corresponds to viFlush function of the VISA library.
+
+        Only the read side is meaningful here: the write buffer is not
+        buffered at all, and data already in flight on the synchronous
+        channel cannot be discarded without a device clear, which is what
+        viClear is for.
+
+        Parameters
+        ----------
+        mask : constants.BufferOperation
+            Specifies the action to be taken with flushing the buffer.
+
+        Returns
+        -------
+        constants.StatusCode
+            Return value of the library call.
+
+        """
+        if (
+            mask & BufferOperation.discard_read_buffer
+            or mask & BufferOperation.discard_read_buffer_no_io
+            or mask & BufferOperation.discard_receive_buffer
+            or mask & BufferOperation.discard_receive_buffer2
+        ):
+            self._pending_buffer.clear()
+
+        return StatusCode.success
+
+    def assert_trigger(self, protocol: constants.TriggerProtocol) -> StatusCode:
+        """Asserts software or hardware trigger.
+
+        Corresponds to viAssertTrigger function of the VISA library.
+
+        Parameters
+        ----------
+        protocol : constants.TriggerProtocol
+            Trigger protocol to use during assertion. Only default is supported.
+
+        Returns
+        -------
+        StatusCode
+            Return value of the library call.
+
+        """
+        if protocol != constants.TriggerProtocol.default:
+            return StatusCode.error_nonsupported_operation
+
+        try:
+            self.interface.trigger()
+        except socket.timeout:
+            return StatusCode.error_timeout
+        except hislip.HiSLIPConnectionLost:
+            LOGGER.exception("HiSLIP connection lost while triggering")
+            return StatusCode.error_connection_lost
+        except OSError:
+            LOGGER.exception("Failed to trigger over the HiSLIP connection")
+            return StatusCode.error_io
+
+        return StatusCode.success
+
+    def gpib_control_ren(self, mode: constants.RENLineOperation) -> StatusCode:
+        """Controls the state of the REN line and the device remote/local state.
+
+        Corresponds to viGpibControlREN function of the VISA library, which
+        VISA also defines for TCPIP INSTR sessions.  HiSLIP carries this as an
+        AsyncRemoteLocalControl request whose control codes line up one for one
+        with the VISA operations.
+
+        Parameters
+        ----------
+        mode : constants.RENLineOperation
+            State of the REN line and optionally the device remote/local state.
+
+        Returns
+        -------
+        StatusCode
+            Return value of the library call.
+
+        """
+        try:
+            control = HISLIP_REMOTE_LOCAL_CONTROL[constants.RENLineOperation(mode)]
+        except (KeyError, ValueError):
+            return StatusCode.error_invalid_mode
+
+        try:
+            self.interface.async_remote_local_control(control)
+        except socket.timeout:
+            return StatusCode.error_timeout
+        except hislip.HiSLIPConnectionLost:
+            LOGGER.exception("HiSLIP connection lost during remote/local control")
+            return StatusCode.error_connection_lost
+        except OSError:
+            LOGGER.exception("Failed to perform HiSLIP remote/local control")
+            return StatusCode.error_io
+
+        return StatusCode.success
+
+    def lock(
+        self,
+        lock_type: constants.Lock,
+        timeout: int,
+        requested_key: Optional[str] = None,
+    ) -> Tuple[str, StatusCode]:
+        """Establishes an access mode to the specified resources.
+
+        Corresponds to viLock function of the VISA library.
+
+        HiSLIP distinguishes the two lock kinds by the lock string: an empty
+        one requests an exclusive lock, a named one a shared lock.
+
+        Parameters
+        ----------
+        lock_type : constants.Lock
+            Specifies the type of lock requested.
+        timeout : int
+            Absolute time period (in milliseconds) that a resource waits to get
+            unlocked by the locking session before returning an error.
+        requested_key : Optional[str], optional
+            Requested locking key in the case of a shared lock. For an exclusive
+            lock it should be None.
+
+        Returns
+        -------
+        str
+            Key that can then be passed to other sessions to share the lock, or
+            an empty string for an exclusive lock.
+        StatusCode
+            Return value of the library call.
+
+        """
+        if lock_type == constants.Lock.exclusive:
+            lock_string = ""
+        else:
+            # Any agreed-upon name works; generate one when the caller did not
+            # supply a key to join an existing shared lock.
+            lock_string = requested_key or f"pyvisa-py{random.getrandbits(32):08x}"
+
+        try:
+            response = self.interface.async_lock_request(
+                1e-3 * timeout, lock_string=lock_string
+            )
+        except socket.timeout:
+            return "", StatusCode.error_timeout
+        except hislip.HiSLIPConnectionLost:
+            LOGGER.exception("HiSLIP connection lost while locking")
+            return "", StatusCode.error_connection_lost
+        except OSError:
+            LOGGER.exception("Failed to acquire a HiSLIP lock")
+            return "", StatusCode.error_io
+
+        status = HISLIP_LOCK_ERRORS_TO_VISA.get(response, StatusCode.error_system_error)
+        if status != StatusCode.success:
+            return "", status
+
+        self._lock_state = (
+            constants.VI_EXCLUSIVE_LOCK
+            if lock_type == constants.Lock.exclusive
+            else constants.VI_SHARED_LOCK
+        )
+        return lock_string, status
+
+    def unlock(self) -> StatusCode:
+        """Relinquish a lock for the specified resource.
+
+        Corresponds to viUnlock function of the VISA library.
+
+        Returns
+        -------
+        StatusCode
+            Return value of the library call.
+
+        """
+        if self._lock_state == constants.VI_NO_LOCK:
+            return StatusCode.error_session_not_locked
+
+        try:
+            response = self.interface.async_lock_release()
+        except socket.timeout:
+            return StatusCode.error_timeout
+        except hislip.HiSLIPConnectionLost:
+            LOGGER.exception("HiSLIP connection lost while unlocking")
+            return StatusCode.error_connection_lost
+        except OSError:
+            LOGGER.exception("Failed to release a HiSLIP lock")
+            return StatusCode.error_io
+
+        if response not in ("success", "success shared"):
+            return StatusCode.error_session_not_locked
+
+        self._lock_state = constants.VI_NO_LOCK
         return StatusCode.success
 
     def read_stb(self) -> Tuple[int, StatusCode]:
@@ -858,23 +1171,10 @@ class TCPIPInstrVxi11(Session):
         # https://tech.xing.com/a-reason-for-unexplained-connection-timeouts-on-kubernetes-docker-abd041cf7e02
         if attribute == constants.VI_ATTR_TCPIP_KEEPALIVE:
             if attribute_state is True:
-                self.interface.sock.setsockopt(
-                    socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1
-                )
-                self.interface.sock.setsockopt(
-                    socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60
-                )
-                self.interface.sock.setsockopt(
-                    socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 60
-                )
-                self.interface.sock.setsockopt(
-                    socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 5
-                )
+                set_keepalive(self.interface.sock, True)
                 self.keepalive = True
             elif attribute_state is False:
-                self.interface.sock.setsockopt(
-                    socket.SOL_SOCKET, socket.SO_KEEPALIVE, 0
-                )
+                set_keepalive(self.interface.sock, False)
                 self.keepalive = False
             else:
                 return StatusCode.error_nonsupported_format
@@ -1551,12 +1851,7 @@ class TCPIPSocketSession(Session):
         self, attribute: ResourceAttribute, attribute_state: bool
     ) -> StatusCode:
         if self.interface:
-            self.interface.setsockopt(
-                socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1 if attribute_state else 0
-            )
-            self.interface.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
-            self.interface.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 60)
-            self.interface.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 5)
+            set_keepalive(self.interface, bool(attribute_state))
             return StatusCode.success
         return StatusCode.error_nonsupported_attribute
 

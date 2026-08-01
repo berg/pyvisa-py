@@ -4,14 +4,21 @@ Python implementation of HiSLIP protocol.  Based on the HiSLIP spec:
 http://www.ivifoundation.org/downloads/Class%20Specifications/IVI-6.1_HiSLIP-1.1-2024-02-24.pdf
 """
 
+import queue
 import select
 import socket
 import struct
 import threading
 import time
-from typing import Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
-from pyvisa_py.common import BytesBuffer, MutableBytesBuffer
+from pyvisa_py.common import (
+    LOGGER,
+    BytesBuffer,
+    MutableBytesBuffer,
+    SupportsRecvInto,
+    set_keepalive,
+)
 
 PORT = 4880
 
@@ -131,6 +138,14 @@ class HiSLIPInterruptedError(Exception):
         super().__init__(f"HiSLIP I/O terminated (message_id={message_id:#x})")
 
 
+class HiSLIPConnectionLost(RuntimeError):
+    """Raised when the server closes a HiSLIP connection unexpectedly.
+
+    Subclasses ``RuntimeError`` because that is what earlier versions of this
+    module raised for a dropped connection.
+    """
+
+
 class CancellableSocket(socket.socket):
     """Socket subclass that supports cross-thread cancellation via select().
 
@@ -198,7 +213,7 @@ class CancellableSocket(socket.socket):
 #########################################################################################
 
 
-def receive_flush(sock: socket.socket, recv_len: int) -> None:
+def receive_flush(sock: SupportsRecvInto, recv_len: int) -> None:
     """
     receive exactly 'recv_len' bytes from 'sock'.
     no explicit timeout is specified, since it is assumed
@@ -216,7 +231,7 @@ def receive_flush(sock: socket.socket, recv_len: int) -> None:
         bytes_recvd += data_len
 
 
-def receive_exact(sock: socket.socket, recv_len: int) -> bytearray:
+def receive_exact(sock: SupportsRecvInto, recv_len: int) -> bytearray:
     """
     receive exactly 'recv_len' bytes from 'sock'.
     no explicit timeout is specified, since it is assumed
@@ -228,7 +243,7 @@ def receive_exact(sock: socket.socket, recv_len: int) -> bytearray:
     return recv_buffer
 
 
-def receive_exact_into(sock: socket.socket, recv_buffer: MutableBytesBuffer) -> None:
+def receive_exact_into(sock: SupportsRecvInto, recv_buffer: MutableBytesBuffer) -> None:
     """
     receive data from 'sock' to exactly fill 'recv_buffer'.
     no explicit timeout is specified, since it is assumed
@@ -242,7 +257,7 @@ def receive_exact_into(sock: socket.socket, recv_buffer: MutableBytesBuffer) -> 
         request_size = recv_len - bytes_recvd
         data_len = sock.recv_into(view, request_size)
         if data_len == 0:
-            raise RuntimeError("Connection was dropped by server.")
+            raise HiSLIPConnectionLost("Connection was dropped by server.")
         bytes_recvd += data_len
         view = view[data_len:]
 
@@ -281,7 +296,7 @@ class RxHeader:
 
     def __init__(
         self,
-        sock: socket.socket,
+        sock: SupportsRecvInto,
         expected_message_type: Optional[str] = None,
     ) -> None:
         """receive and decode the HiSLIP message header"""
@@ -326,7 +341,7 @@ class RxHeader:
 
 
 class InitializeResponse(RxHeader):
-    def __init__(self, sock: socket.socket) -> None:
+    def __init__(self, sock: SupportsRecvInto) -> None:
         super().__init__(sock, "InitializeResponse")
         assert self.payload_length == 0
         self.overlap = bool(self.control_code)
@@ -334,7 +349,7 @@ class InitializeResponse(RxHeader):
 
 
 class AsyncInitializeResponse(RxHeader):
-    def __init__(self, sock: socket.socket) -> None:
+    def __init__(self, sock: SupportsRecvInto) -> None:
         super().__init__(sock, "AsyncInitializeResponse")
         assert self.control_code == 0
         assert self.payload_length == 0
@@ -342,7 +357,7 @@ class AsyncInitializeResponse(RxHeader):
 
 
 class AsyncMaxMsgSizeResponse(RxHeader):
-    def __init__(self, sock: socket.socket) -> None:
+    def __init__(self, sock: SupportsRecvInto) -> None:
         super().__init__(sock, "AsyncMaxMsgSizeResponse")
         assert self.control_code == 0
         assert self.message_parameter == 0
@@ -352,7 +367,7 @@ class AsyncMaxMsgSizeResponse(RxHeader):
 
 
 class AsyncDeviceClearAcknowledge(RxHeader):
-    def __init__(self, sock: socket.socket) -> None:
+    def __init__(self, sock: SupportsRecvInto) -> None:
         super().__init__(sock, "AsyncDeviceClearAcknowledge")
         self.feature_bitmap = self.control_code
         assert self.message_parameter == 0
@@ -360,7 +375,7 @@ class AsyncDeviceClearAcknowledge(RxHeader):
 
 
 class AsyncInterrupted(RxHeader):
-    def __init__(self, sock: socket.socket) -> None:
+    def __init__(self, sock: SupportsRecvInto) -> None:
         super().__init__(sock, "AsyncInterrupted")
         assert self.control_code == 0
         self.message_id = self.message_parameter
@@ -368,7 +383,7 @@ class AsyncInterrupted(RxHeader):
 
 
 class AsyncLockInfoResponse(RxHeader):
-    def __init__(self, sock: socket.socket) -> None:
+    def __init__(self, sock: SupportsRecvInto) -> None:
         super().__init__(sock, "AsyncLockInfoResponse")
         self.exclusive_lock = self.control_code  # 0: no lock, 1: lock granted
         self.clients_holding_locks = self.message_parameter
@@ -376,7 +391,7 @@ class AsyncLockInfoResponse(RxHeader):
 
 
 class AsyncLockResponse(RxHeader):
-    def __init__(self, sock: socket.socket) -> None:
+    def __init__(self, sock: SupportsRecvInto) -> None:
         super().__init__(sock, "AsyncLockResponse")
         self.lock_response = LOCKRESPONSE[self.control_code]
         assert self.message_parameter == 0
@@ -384,7 +399,7 @@ class AsyncLockResponse(RxHeader):
 
 
 class AsyncRemoteLocalResponse(RxHeader):
-    def __init__(self, sock: socket.socket) -> None:
+    def __init__(self, sock: SupportsRecvInto) -> None:
         super().__init__(sock, "AsyncRemoteLocalResponse")
         assert self.control_code == 0
         assert self.message_parameter == 0
@@ -392,7 +407,7 @@ class AsyncRemoteLocalResponse(RxHeader):
 
 
 class AsyncServiceRequest(RxHeader):
-    def __init__(self, sock: socket.socket) -> None:
+    def __init__(self, sock: SupportsRecvInto) -> None:
         super().__init__(sock, "AsyncServiceRequest")
         self.server_status = self.control_code
         assert self.message_parameter == 0
@@ -400,7 +415,7 @@ class AsyncServiceRequest(RxHeader):
 
 
 class AsyncStatusResponse(RxHeader):
-    def __init__(self, sock: socket.socket) -> None:
+    def __init__(self, sock: SupportsRecvInto) -> None:
         super().__init__(sock, "AsyncStatusResponse")
         self.server_status = self.control_code
         assert self.message_parameter == 0
@@ -408,7 +423,7 @@ class AsyncStatusResponse(RxHeader):
 
 
 class DeviceClearAcknowledge(RxHeader):
-    def __init__(self, sock: socket.socket) -> None:
+    def __init__(self, sock: SupportsRecvInto) -> None:
         super().__init__(sock, "DeviceClearAcknowledge")
         self.feature_bitmap = self.control_code
         assert self.message_parameter == 0
@@ -416,7 +431,7 @@ class DeviceClearAcknowledge(RxHeader):
 
 
 class Interrupted(RxHeader):
-    def __init__(self, sock: socket.socket) -> None:
+    def __init__(self, sock: SupportsRecvInto) -> None:
         super().__init__(sock, "Interrupted")
         assert self.control_code == 0
         self.message_id = self.message_parameter
@@ -424,7 +439,7 @@ class Interrupted(RxHeader):
 
 
 class Error(RxHeader):
-    def __init__(self, sock: socket.socket) -> None:
+    def __init__(self, sock: SupportsRecvInto) -> None:
         super().__init__(sock, "Error")
         self.error_code = ERRORMESSAGE[self.control_code]
         assert self.message_parameter == 0
@@ -432,11 +447,235 @@ class Error(RxHeader):
 
 
 class FatalError(RxHeader):
-    def __init__(self, sock: socket.socket) -> None:
+    def __init__(self, sock: SupportsRecvInto) -> None:
         super().__init__(sock, "FatalError")
         self.error_code = FATALERRORMESSAGE[self.control_code]
         assert self.message_parameter == 0
         self.error_message = receive_exact(sock, self.payload_length)
+
+
+class BufferedMessage:
+    """Socket-like reader that serves one already-received message.
+
+    The ``RxHeader`` subclasses read straight from a socket.  When the async
+    channel is demultiplexed by a background thread the bytes have already
+    been read, so they are replayed through this shim instead, which lets the
+    response classes be reused unchanged.
+    """
+
+    def __init__(self, data: bytes) -> None:
+        self._data = memoryview(data)
+        self._pos = 0
+
+    def recv_into(self, buffer, nbytes: int = 0, flags: int = 0) -> int:
+        view = memoryview(buffer)
+        available = len(self._data) - self._pos
+        count = min(nbytes or len(view), len(view), available)
+        view[:count] = self._data[self._pos : self._pos + count]
+        self._pos += count
+        return count
+
+
+class AsyncChannel:
+    """Owns the HiSLIP asynchronous socket and demultiplexes incoming messages.
+
+    The server may send an ``AsyncServiceRequest`` at any time, including in
+    the middle of an unrelated request/response exchange.  A single reader
+    thread therefore owns the socket: service requests are dispatched to the
+    SRQ callback and every other message is handed to whichever thread is
+    waiting in :meth:`transaction`.
+
+    Requests are serialised by a lock, so at most one response is outstanding
+    at a time.
+    """
+
+    def __init__(self, sock: socket.socket, timeout: float) -> None:
+        self._sock = sock
+        self._timeout = timeout
+        # Reads in the reader thread block until a whole message arrives; the
+        # idle wait is done with select() so the thread stays interruptible.
+        self._sock.settimeout(None)
+        self._request_lock = threading.Lock()
+        self._responses: "queue.Queue[Optional[bytes]]" = queue.Queue()
+        self._srq_callback: Optional[Callable[[int], None]] = None
+        self._srq_lock = threading.Lock()
+        # Service requests are handed to a second thread so that a callback
+        # is free to talk to the instrument — the usual reaction to an SRQ is
+        # to read the status byte, which needs the reader thread to be free
+        # to deliver the response.
+        self._srq_queue: "queue.Queue[Optional[int]]" = queue.Queue()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._reader, name="hislip-async", daemon=True
+        )
+        self._srq_thread = threading.Thread(
+            target=self._srq_worker, name="hislip-srq", daemon=True
+        )
+        self._thread.start()
+        self._srq_thread.start()
+
+    @property
+    def timeout(self) -> float:
+        """Time in seconds to wait for the response to a request."""
+        return self._timeout
+
+    @timeout.setter
+    def timeout(self, value: float) -> None:
+        self._timeout = value
+
+    def set_srq_callback(self, callback: Optional[Callable[[int], None]]) -> None:
+        """Register (or clear) the callback invoked on AsyncServiceRequest.
+
+        The callback receives the status byte carried by the service request.
+        It runs on a dedicated thread and may perform I/O on the instrument.
+        """
+        with self._srq_lock:
+            self._srq_callback = callback
+
+    def close(self) -> None:
+        self._stop.set()
+        self._srq_queue.put(None)
+        try:
+            self._sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self._sock.close()
+        self._thread.join(timeout=2.0)
+        self._srq_thread.join(timeout=2.0)
+
+    def transaction(
+        self,
+        msg_type: str,
+        control_code: int,
+        message_parameter: Optional[int],
+        payload: BytesBuffer = b"",
+        timeout: Optional[float] = None,
+    ) -> BufferedMessage:
+        """Send a request and return the matching response as a reader.
+
+        Parameters
+        ----------
+        timeout : float, optional
+            Seconds to wait for the response.  Defaults to the channel
+            timeout; pass a larger value for requests such as ``AsyncLock``
+            that the server is expected to sit on.
+
+        """
+        wait = self.timeout if timeout is None else timeout
+        with self._request_lock:
+            # A previous request may have timed out and been answered since;
+            # that answer is not ours, so drop it rather than mistake it for
+            # the response to this request.
+            self._discard_stale_responses()
+            try:
+                send_msg(self._sock, msg_type, control_code, message_parameter, payload)
+            except OSError as error:
+                raise HiSLIPConnectionLost(
+                    f"could not send {msg_type}: {error}"
+                ) from error
+            try:
+                response = self._responses.get(timeout=wait)
+            except queue.Empty:
+                raise socket.timeout(
+                    f"timed out waiting for the response to {msg_type}"
+                ) from None
+        if response is None:
+            raise HiSLIPConnectionLost(
+                "the asynchronous channel was closed by the server"
+            )
+        return BufferedMessage(response)
+
+    def _discard_stale_responses(self) -> None:
+        """Drop queued responses left over from a request that timed out."""
+        while True:
+            try:
+                stale = self._responses.get_nowait()
+            except queue.Empty:
+                return
+            if stale is None:
+                # End-of-channel sentinel: put it back so the next waiter
+                # still sees that the connection is gone.
+                self._responses.put(None)
+                return
+
+    def _reader(self) -> None:
+        """Read messages until the channel is closed, dispatching each one."""
+        try:
+            while not self._stop.is_set():
+                try:
+                    readable, _, _ = select.select([self._sock], [], [], 0.5)
+                except (OSError, ValueError):
+                    break
+                if not readable:
+                    continue
+
+                try:
+                    message = self._read_message()
+                except (OSError, RuntimeError, struct.error):
+                    if not self._stop.is_set():
+                        LOGGER.debug(
+                            "HiSLIP asynchronous channel closed", exc_info=True
+                        )
+                    break
+
+                if message is None:
+                    break
+
+                msg_type, raw = message
+                if msg_type == "AsyncServiceRequest":
+                    self._dispatch_srq(raw)
+                else:
+                    self._responses.put(raw)
+        finally:
+            # Unblock anyone waiting on a response to a request that can no
+            # longer be answered.
+            self._responses.put(None)
+
+    def _read_message(self) -> Optional[Tuple[str, bytes]]:
+        """Read one complete message.  Returns None if the peer hung up."""
+        header = bytearray(HEADER_SIZE)
+        view = memoryview(header)
+        received = 0
+        while received < HEADER_SIZE:
+            count = self._sock.recv_into(view, HEADER_SIZE - received)
+            if count == 0:
+                return None
+            received += count
+            view = view[count:]
+
+        prologue, msg_type, _, _, payload_length = struct.unpack(HEADER_FORMAT, header)
+        if prologue != b"HS":
+            raise HiSLIPConnectionLost("protocol synchronization error")
+
+        payload = receive_exact(self._sock, payload_length) if payload_length else b""
+        return MESSAGETYPE_STR.get(msg_type, ""), bytes(header) + bytes(payload)
+
+    def _dispatch_srq(self, raw: bytes) -> None:
+        """Queue a service request for the worker thread to deliver."""
+        with self._srq_lock:
+            if self._srq_callback is None:
+                return
+        try:
+            status_byte = AsyncServiceRequest(BufferedMessage(raw)).server_status
+        except Exception:
+            LOGGER.exception("could not decode a HiSLIP service request")
+            return
+        self._srq_queue.put(status_byte)
+
+    def _srq_worker(self) -> None:
+        """Deliver queued service requests to the registered callback."""
+        while True:
+            status_byte = self._srq_queue.get()
+            if status_byte is None or self._stop.is_set():
+                return
+            with self._srq_lock:
+                callback = self._srq_callback
+            if callback is None:
+                continue
+            try:
+                callback(status_byte)
+            except Exception:
+                LOGGER.exception("error dispatching HiSLIP service request")
 
 
 class Instrument:
@@ -448,7 +687,7 @@ class Instrument:
     def __init__(
         self,
         ip_addr: str,
-        open_timeout: Optional[float] = 0.0,
+        open_timeout: Optional[float] = None,
         timeout: Optional[float] = None,
         port: int = PORT,
         sub_address: str = "hislip0",
@@ -460,13 +699,24 @@ class Instrument:
         #     S->C: AsyncInitializeResponse
 
         timeout = timeout or 5.0
+        # ``open_timeout`` is expressed in milliseconds, like the VISA
+        # attribute it comes from.
+        connect_timeout = 5.0 if open_timeout is None else 1e-3 * open_timeout
+
+        # Message state has to exist before any I/O: initialize() and the
+        # async channel reader may both touch it.
+        self._rmt = 0
+        self._message_id = 0xFFFF_FF00
+        self._last_message_id: Optional[int] = None
+        self._msg_type: str = ""
+        self._payload_remaining: int = 0
+        self._receiving = threading.Event()
+        self._timeout = timeout
+        self._async_channel: Optional[AsyncChannel] = None
 
         # open the synchronous socket and send an initialize packet
         raw_sync = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # The VISA spec does not allow to tune the socket timeout when opening
-        # a connection. ``open_timeout`` only applies to attempt to acquire a
-        # lock.
-        raw_sync.settimeout(5.0)
+        raw_sync.settimeout(connect_timeout)
         raw_sync.connect((ip_addr, port))
         raw_sync.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
@@ -477,37 +727,52 @@ class Instrument:
 
         init = self.initialize(sub_address=sub_address.encode("ascii"))
         if init.overlap != 0:
-            print("**** prefer overlap = %d" % init.overlap)
+            LOGGER.debug("HiSLIP server prefers overlap = %d", init.overlap)
         # We set the user timeout once we managed to initialize the connection.
         self._sync.settimeout(timeout)
 
         # open the asynchronous socket and send an initialize packet
         self._async = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._async.settimeout(connect_timeout)
         self._async.connect((ip_addr, port))
-        self._async.settimeout(5.0)
         self._async.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self._async_init = self.async_initialize(session_id=init.session_id)
-        # We set the user timeout once we managed to initialize the connection.
-        self._async.settimeout(timeout)
+
+        # From here on the async socket is owned by the channel reader thread,
+        # which splits service requests out from ordinary responses.
+        self._async_channel = AsyncChannel(self._async, timeout)
 
         # initialize variables
         self.max_msg_size = DEFAULT_MAX_MSG_SIZE
         self.keepalive = False
-        self.timeout = timeout
-        self._rmt = 0
-        self._message_id = 0xFFFF_FF00
-        self._last_message_id: Optional[int] = None
-        self._msg_type: str = ""
-        self._payload_remaining: int = 0
-        self._receiving = threading.Event()
 
     # ================ #
     # MEMBER FUNCTIONS #
     # ================ #
 
+    @property
+    def async_channel(self) -> AsyncChannel:
+        """The demultiplexed asynchronous channel."""
+        if self._async_channel is None:
+            raise HiSLIPConnectionLost("the asynchronous channel is not open")
+        return self._async_channel
+
+    def set_srq_callback(self, callback: Optional[Callable[[int], None]]) -> None:
+        """Register (or clear) a callback fired on AsyncServiceRequest.
+
+        The callback receives the status byte carried by the service request.
+        It runs on the channel reader thread and must not block or perform
+        I/O on this instrument.
+        """
+        self.async_channel.set_srq_callback(callback)
+
     def close(self) -> None:
         self._sync.close()
-        self._async.close()
+        if self._async_channel is not None:
+            self._async_channel.close()
+            self._async_channel = None
+        else:
+            self._async.close()
 
     @property
     def timeout(self) -> float:
@@ -519,7 +784,10 @@ class Instrument:
         """Timeout value in seconds for both the sync and async sockets"""
         self._timeout = val
         self._sync.settimeout(self._timeout)
-        self._async.settimeout(self._timeout)
+        # The async socket itself stays blocking — it is read by the channel
+        # thread — so the timeout applies to waiting for a response instead.
+        if self._async_channel is not None:
+            self._async_channel.timeout = val
 
     @property
     def max_msg_size(self) -> int:
@@ -558,14 +826,23 @@ class Instrument:
     @keepalive.setter
     def keepalive(self, keepalive: bool) -> None:
         self._keepalive = bool(keepalive)
-        self._sync.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, bool(keepalive))
-        self._async.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, bool(keepalive))
+        set_keepalive(self._sync, self._keepalive)
+        set_keepalive(self._async, self._keepalive)
 
-    def send(self, data: BytesBuffer) -> int:
+    def send(self, data: BytesBuffer, end: bool = True) -> int:
         """Send the data on the synchronous channel.
 
         More than one packet may be necessary in order
         to not exceed max_payload_size.
+
+        Parameters
+        ----------
+        end : bool, optional
+            Whether to mark the end of the message, which HiSLIP does by
+            sending the final chunk as a DataEND rather than a Data message.
+            This is the transport's equivalent of asserting EOI on GPIB, so
+            it follows VI_ATTR_SEND_END_EN.
+
         """
         # print(f"send({data=})")  # uncomment for debugging
         data_view = memoryview(data)
@@ -576,7 +853,10 @@ class Instrument:
         while num_bytes_to_send > 0:
             if num_bytes_to_send <= max_payload_size:
                 assert len(data_view) == num_bytes_to_send
-                self._send_data_end_packet(data_view)
+                if end:
+                    self._send_data_end_packet(data_view)
+                else:
+                    self._send_data_packet(data_view)
                 bytes_sent = num_bytes_to_send
             else:
                 self._send_data_packet(data_view[:max_payload_size])
@@ -678,10 +958,57 @@ class Instrument:
         # Abandon pending messages and wait for in-process synchronous messages
         # to complete.
         time.sleep(0.1)
+        # Discard whatever they left in the socket, otherwise the
+        # DeviceClearAcknowledge below would be read out of a stale stream.
+        self._discard_sync_input()
         # Indicate to server that synchronous channel is cleared out.
         self.device_clear_complete(feature)
-        # reset messageID and resume normal opreation
+        # reset messageID and resume normal operation
+        self._reset_message_state()
+
+    def _reset_message_state(self) -> None:
+        """Return the message bookkeeping to its just-connected state."""
         self._message_id = 0xFFFF_FF00
+        self._last_message_id = None
+        self._rmt = 0
+        self._payload_remaining = 0
+        self._msg_type = ""
+
+    def _discard_sync_input(self) -> None:
+        """Drop anything sitting in the synchronous socket's receive buffer."""
+        self._sync.setblocking(False)
+        try:
+            while True:
+                try:
+                    if not self._sync.recv(65536):
+                        break
+                except BlockingIOError:
+                    break
+                except OSError:
+                    break
+        finally:
+            self._sync.setblocking(True)
+            self._sync.settimeout(self._timeout)
+
+    def _await_interrupted(self, timeout: float = 2.0) -> bool:
+        """Read the sync channel until the server's Interrupted message.
+
+        Returns True if it arrived, False if we gave up waiting.
+        """
+        saved_timeout = self._sync.gettimeout()
+        self._sync.settimeout(timeout)
+        try:
+            while True:
+                header = RxHeader(self._sync)
+                if header.msg_type == "Interrupted":
+                    return True
+                # Discard payload of any other messages
+                if header.payload_length > 0:
+                    receive_flush(self._sync, header.payload_length)
+        except (socket.timeout, RuntimeError):
+            return False
+        finally:
+            self._sync.settimeout(saved_timeout)
 
     def terminate(self) -> None:
         """Cancel a pending I/O operation on the synchronous channel.
@@ -727,52 +1054,23 @@ class Instrument:
             # 2. Drain any bytes left in the sync socket buffer.
             #    After terminate() interrupted a read mid-stream, there may be
             #    partial HiSLIP message data in the buffer.
-            self._sync.setblocking(False)
-            try:
-                while True:
-                    try:
-                        chunk = self._sync.recv(65536)
-                        if not chunk:
-                            break
-                    except BlockingIOError:
-                        break
-            finally:
-                self._sync.setblocking(True)
-                self._sync.settimeout(self._timeout)
+            self._discard_sync_input()
 
             # 3. Full device clear: AsyncDeviceClear → Interrupted →
             #    DeviceClearComplete → DeviceClearAcknowledge
             feature = self.async_device_clear()
 
-            # Read from the sync channel until we get the Interrupted message.
             # The server sends Interrupted after acknowledging AsyncDeviceClear.
-            saved_timeout = self._sync.gettimeout()
-            self._sync.settimeout(2.0)
-            try:
-                while True:
-                    header = RxHeader(self._sync)
-                    if header.msg_type == "Interrupted":
-                        break
-                    # Discard payload of any other messages
-                    if header.payload_length > 0:
-                        receive_flush(self._sync, header.payload_length)
-            except socket.timeout:
-                # Server didn't send Interrupted — proceed anyway.
-                # DeviceClearComplete will still reset the protocol.
-                pass
-            finally:
-                self._sync.settimeout(saved_timeout)
+            # If it doesn't, proceed anyway — DeviceClearComplete still resets
+            # the protocol.
+            self._await_interrupted()
 
             self.device_clear_complete(feature)
         finally:
             self._sync._cancel_enabled = True
 
         # 4. Reset all protocol state
-        self._message_id = 0xFFFF_FF00
-        self._last_message_id = None
-        self._rmt = 0
-        self._payload_remaining = 0
-        self._msg_type = ""
+        self._reset_message_state()
 
     def initialize(
         self,
@@ -816,9 +1114,8 @@ class Instrument:
         #     C->S: AsyncMaxMsgSize
         #     S->C: AsyncMaxMsgSizeResponse
         payload = struct.pack("!Q", size)
-        send_msg(self._async, "AsyncMaxMsgSize", 0, 0, payload)
-        response = AsyncMaxMsgSizeResponse(self._async)
-        return response.max_msg_size
+        response = self.async_channel.transaction("AsyncMaxMsgSize", 0, 0, payload)
+        return AsyncMaxMsgSizeResponse(response).max_msg_size
 
     def async_lock_info(self) -> int:
         """
@@ -828,13 +1125,18 @@ class Instrument:
         # async_lock_info transaction:
         #     C->S: AsyncLockInfo
         #     S->C: AsyncLockInfoResponse
-        send_msg(self._async, "AsyncLockInfo", 0, 0)
-        response = AsyncLockInfoResponse(self._async)
-        return response.exclusive_lock
+        response = self.async_channel.transaction("AsyncLockInfo", 0, 0)
+        return AsyncLockInfoResponse(response).exclusive_lock
 
     def async_lock_request(self, timeout: float, lock_string: str = "") -> str:
         """
         perform an AsyncLock request transaction.
+
+        An empty ``lock_string`` requests an exclusive lock, anything else
+        requests a shared lock under that name.  ``timeout`` is the time in
+        seconds the server may spend waiting for the lock to become available;
+        we wait a little longer than that for its answer.
+
         returns the lock_response from the AsyncLockResponse packet.
         """
         # async_lock transaction:
@@ -842,9 +1144,14 @@ class Instrument:
         #     S->C: AsyncLockResponse
         ctrl_code = LOCKCONTROLCODE["request"]
         timeout_ms = int(1e3 * timeout)
-        send_msg(self._async, "AsyncLock", ctrl_code, timeout_ms, lock_string.encode())
-        response = AsyncLockResponse(self._async)
-        return response.lock_response
+        response = self.async_channel.transaction(
+            "AsyncLock",
+            ctrl_code,
+            timeout_ms,
+            lock_string.encode(),
+            timeout=timeout + self.async_channel.timeout,
+        )
+        return AsyncLockResponse(response).lock_response
 
     def async_lock_release(self) -> str:
         """
@@ -855,9 +1162,10 @@ class Instrument:
         #     C->S: AsyncLock
         #     S->C: AsyncLockResponse
         ctrl_code = LOCKCONTROLCODE["release"]
-        send_msg(self._async, "AsyncLock", ctrl_code, self.last_message_id)
-        response = AsyncLockResponse(self._async)
-        return response.lock_response
+        response = self.async_channel.transaction(
+            "AsyncLock", ctrl_code, self.last_message_id
+        )
+        return AsyncLockResponse(response).lock_response
 
     def async_remote_local_control(self, remotelocalcontrol: str) -> None:
         """
@@ -867,10 +1175,11 @@ class Instrument:
         #     C->S: AsyncRemoteLocalControl
         #     S->C: AsyncRemoteLocalResponse
         ctrl_code = REMOTELOCALCONTROLCODE[remotelocalcontrol]
-        send_msg(
-            self._async, "AsyncRemoteLocalControl", ctrl_code, self.last_message_id
+        AsyncRemoteLocalResponse(
+            self.async_channel.transaction(
+                "AsyncRemoteLocalControl", ctrl_code, self.last_message_id
+            )
         )
-        AsyncRemoteLocalResponse(self._async)
 
     def async_status_query(self) -> int:
         """
@@ -880,19 +1189,22 @@ class Instrument:
         # async_status_query transaction:
         #     C->S: AsyncStatusQuery
         #     S->C: AsyncStatusResponse
-        send_msg(self._async, "AsyncStatusQuery", self._rmt, self._message_id)
+        #
+        # The MessageID carried here is the id the next Data/DataEND/Trigger
+        # message will use, matching other HiSLIP client implementations.
+        response = self.async_channel.transaction(
+            "AsyncStatusQuery", self._rmt, self._message_id
+        )
         self._rmt = 0
-        response = AsyncStatusResponse(self._async)
-        return response.server_status
+        return AsyncStatusResponse(response).server_status
 
     def async_device_clear(self) -> int:
         """
         perform an AsyncDeviceClear transaction.
         returns the feature_bitmap from the AsyncDeviceClearAcknowledge packet.
         """
-        send_msg(self._async, "AsyncDeviceClear", 0, 0)
-        response = AsyncDeviceClearAcknowledge(self._async)
-        return response.feature_bitmap
+        response = self.async_channel.transaction("AsyncDeviceClear", 0, 0)
+        return AsyncDeviceClearAcknowledge(response).feature_bitmap
 
     def device_clear_complete(self, feature_bitmap: int) -> int:
         """

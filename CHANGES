@@ -4,7 +4,45 @@ PyVISA-py Changelog
 0.9.0 (unreleased)
 ------------------
 
-- Removed additional read_stb inside VXI-11 (TCPIP::INSTR) SRQ handling. 
+- Bring HiSLIP (TCPIP::INSTR) sessions to parity with VXI-11 and GPIB:
+
+  - The asynchronous channel is now read by a dedicated thread that
+    demultiplexes messages. This fixes a latent bug where an
+    ``AsyncServiceRequest`` arriving during an unrelated exchange (a status
+    query, a lock request, ...) was mistaken for its response and raised a
+    protocol synchronization error.
+  - SRQ events are supported: ``viEnableEvent``, ``viWaitOnEvent``,
+    ``viInstallHandler`` and friends now work for HiSLIP resources. The
+    status byte travels with the service request, so no status query is
+    issued from the handler.
+  - ``viLock``/``viUnlock`` are implemented, for both exclusive and shared
+    locks, and ``VI_ATTR_RSRC_LOCK_STATE`` reports the session's lock state.
+  - ``viAssertTrigger`` is implemented. It previously raised an uncaught
+    ``NotImplementedError`` instead of returning a status code.
+  - ``viGpibControlREN`` is implemented on top of AsyncRemoteLocalControl.
+  - ``viFlush`` is implemented for the read buffer.
+  - ``VI_ATTR_TERMCHAR``/``VI_ATTR_TERMCHAR_EN`` are honoured on read, and
+    ``VI_ATTR_SEND_END_EN`` on write (a message with END suppressed is sent
+    as Data rather than DataEND).
+  - ``viRead`` now returns ``VI_SUCCESS`` rather than
+    ``VI_SUCCESS_TERM_CHAR`` when a read ends because of the END indicator
+    (a DataEND message). ``VI_SUCCESS_TERM_CHAR`` is now returned only when
+    a termination character actually stopped the read. This is a behaviour
+    change for code inspecting the status of a HiSLIP read.
+  - ``device_clear`` discards data left in the synchronous channel and resets
+    all message-tracking state, instead of only the message id. A stale
+    message could previously desynchronise the next read.
+  - ``open_timeout`` is applied to the connection attempt. It was accepted
+    and then ignored, and was also scaled as though it were in seconds when
+    it is in milliseconds.
+  - Read, write, trigger, lock and remote/local operations map dropped
+    connections to ``VI_ERROR_CONN_LOST`` and other socket failures to
+    ``VI_ERROR_IO``, rather than letting the exception escape.
+
+- Set the TCP keepalive probe timers defensively for all TCPIP resources.
+  ``VI_ATTR_TCPIP_KEEPALIVE`` raised ``AttributeError`` on platforms without
+  ``socket.TCP_KEEPIDLE``, which includes macOS.
+- Removed additional read_stb inside VXI-11 (TCPIP::INSTR) SRQ handling.
   It is not standard behaviour, may confuse instruments, and does not 
   cache the SRQ bit as would be required. Closes #603 PR #606
 - Added read_stb, assert_trigger and gpib_control_run functions to usbtmc PR #532

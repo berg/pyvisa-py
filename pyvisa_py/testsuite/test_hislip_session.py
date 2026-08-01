@@ -243,6 +243,37 @@ class TestBasicIO:
         assert data == b"FAKE"
         assert status == StatusCode.success_max_count_read
 
+    def test_read_exactly_message_length(self, session, server):
+        """END wins over the byte count when the two coincide.
+
+        Reporting VI_SUCCESS_MAX_CNT here would send ``read_raw`` back for
+        another read that can only time out.
+        """
+        session.write(b"*IDN?\n")
+        data, status = session.read(len(server.response))
+        assert data == server.response
+        assert status == StatusCode.success
+
+    def test_read_raw_does_not_hang_on_exact_multiple(self, server):
+        """A response that is an exact multiple of the chunk size still ends."""
+        server.response = b"x" * 64
+        sess = TCPIPInstrHiSLIP(
+            0, f"TCPIP0::127.0.0.1::hislip0,{server.port}::INSTR", open_timeout=5000
+        )
+        try:
+            sess.set_attribute(ResourceAttribute.timeout_value, 2000)
+            sess.write(b"*IDN?\n")
+            collected = bytearray()
+            for _ in range(10):
+                data, status = sess.read(16)
+                collected.extend(data)
+                if status != StatusCode.success_max_count_read:
+                    break
+            assert bytes(collected) == server.response
+            assert status == StatusCode.success
+        finally:
+            sess.close()
+
     def test_write_without_send_end(self, session, server):
         """SEND_END_EN false sends Data rather than DataEND."""
         session.set_attribute(ResourceAttribute.send_end_enabled, False)
@@ -417,6 +448,94 @@ class TestLocking:
 
     def test_unlock_without_lock(self, session):
         assert session.unlock() == StatusCode.error_session_not_locked
+
+
+class TestMessageStateRace:
+    """The RMT-delivered flag must be carried by exactly one message.
+
+    It rides on both synchronous messages and on AsyncStatusQuery, and the
+    instrument uses it to decide whether the previous response was consumed.
+    Delivering it twice (or losing it) makes a real instrument answer the
+    next command with "-410 Query INTERRUPTED".
+    """
+
+    def test_rmt_is_consumed_exactly_once(self, session, server):
+        interface = session.interface
+        rmt_seen = []
+
+        def writer():
+            for _ in range(200):
+                interface._rmt = 1  # pretend a response was just consumed
+                rmt, _ = interface._consume_send_state()
+                rmt_seen.append(rmt)
+
+        def status_querier():
+            for _ in range(200):
+                rmt, _ = interface._consume_status_state()
+                rmt_seen.append(rmt)
+
+        threads = [
+            threading.Thread(target=writer),
+            threading.Thread(target=status_querier),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        # Every set flag is claimed by exactly one caller, so the number of
+        # ones observed can never exceed the number of times it was set.
+        assert sum(rmt_seen) <= 200
+
+    def test_message_ids_are_never_reused(self, session):
+        """Concurrent sends must not hand the same message id to two messages."""
+        interface = session.interface
+        ids = []
+        lock = threading.Lock()
+
+        def sender():
+            local = [interface._consume_send_state()[1] for _ in range(200)]
+            with lock:
+                ids.extend(local)
+
+        threads = [threading.Thread(target=sender) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        assert len(ids) == len(set(ids)), "a message id was handed out twice"
+
+    def test_concurrent_status_query_and_write(self, session, server):
+        """A status query racing writes leaves both channels intact."""
+        errors = []
+
+        def writer():
+            for _ in range(100):
+                try:
+                    session.write(b"*IDN?\n")
+                    data, _ = session.read(4096)
+                    if data != server.response:
+                        errors.append(f"bad response {data!r}")
+                except Exception as exc:
+                    errors.append(f"write/read: {exc!r}")
+
+        def querier():
+            for _ in range(100):
+                try:
+                    stb, _ = session.read_stb()
+                    if not 0 <= stb <= 0xFF:
+                        errors.append(f"bad stb {stb!r}")
+                except Exception as exc:
+                    errors.append(f"read_stb: {exc!r}")
+
+        threads = [threading.Thread(target=writer), threading.Thread(target=querier)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+
+        assert not errors, errors[:5]
 
 
 class TestServiceRequests:

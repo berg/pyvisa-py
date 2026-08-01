@@ -126,6 +126,13 @@ HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 
 DEFAULT_MAX_MSG_SIZE = 1 << 20  # from VISA spec
 
+#: Seconds to let in-process synchronous messages finish after the server
+#: acknowledges a device clear, before telling it the channel is clear.
+#: Some instruments need longer than this when several messages were sent
+#: back to back without waiting for a response, and drop the connection if
+#: DeviceClearComplete arrives while they are still working through them.
+DEVICE_CLEAR_SETTLE_TIME = 0.1
+
 
 class HiSLIPInterruptedError(Exception):
     """Raised when a pending I/O operation is cancelled via terminate().
@@ -711,6 +718,9 @@ class Instrument:
         self._msg_type: str = ""
         self._payload_remaining: int = 0
         self._receiving = threading.Event()
+        # Guards the message bookkeeping shared by the synchronous send path
+        # and the asynchronous status query.
+        self._state_lock = threading.RLock()
         self._timeout = timeout
         self._async_channel: Optional[AsyncChannel] = None
 
@@ -805,10 +815,43 @@ class Instrument:
     @last_message_id.setter
     def last_message_id(self, message_id: Optional[int]) -> None:
         """Re-set last message id and related attributes"""
-        self._last_message_id = message_id
-        self._rmt = 0
-        self._payload_remaining = 0
-        self._msg_type = ""
+        with self._state_lock:
+            self._last_message_id = message_id
+            self._rmt = 0
+            self._payload_remaining = 0
+            self._msg_type = ""
+
+    def _consume_send_state(self) -> Tuple[int, int]:
+        """Claim the RMT flag and message id for a message about to be sent.
+
+        The RMT-delivered flag rides on both synchronous messages and on
+        AsyncStatusQuery, and the server tracks it to decide whether the
+        previous response was consumed. Reading and clearing it has to be
+        atomic, or a status query racing a write delivers the flag twice (or
+        loses it) and the instrument answers the next command with
+        "-410 Query INTERRUPTED".
+
+        """
+        with self._state_lock:
+            rmt, message_id = self._rmt, self._message_id
+            self._rmt = 0
+            self._last_message_id = message_id
+            self._payload_remaining = 0
+            self._msg_type = ""
+            self._message_id = (message_id + 2) & 0xFFFF_FFFF
+        return rmt, message_id
+
+    def _consume_status_state(self) -> Tuple[int, int]:
+        """As :meth:`_consume_send_state`, for an AsyncStatusQuery.
+
+        A status query reports the RMT flag but does not consume a message
+        id, so the id is not advanced.
+
+        """
+        with self._state_lock:
+            rmt, message_id = self._rmt, self._message_id
+            self._rmt = 0
+        return rmt, message_id
 
     @property
     def keepalive(self) -> bool:
@@ -913,7 +956,8 @@ class Instrument:
                 # to the client at the end of a response. Note that with HiSLIP
                 # this is implied by the DataEND message.
                 #
-                self._rmt = 1
+                with self._state_lock:
+                    self._rmt = 1
 
             return bytes(recv_buffer)
         finally:
@@ -957,7 +1001,7 @@ class Instrument:
         feature = self.async_device_clear()
         # Abandon pending messages and wait for in-process synchronous messages
         # to complete.
-        time.sleep(0.1)
+        time.sleep(DEVICE_CLEAR_SETTLE_TIME)
         # Discard whatever they left in the socket, otherwise the
         # DeviceClearAcknowledge below would be read out of a stale stream.
         self._discard_sync_input()
@@ -968,11 +1012,12 @@ class Instrument:
 
     def _reset_message_state(self) -> None:
         """Return the message bookkeeping to its just-connected state."""
-        self._message_id = 0xFFFF_FF00
-        self._last_message_id = None
-        self._rmt = 0
-        self._payload_remaining = 0
-        self._msg_type = ""
+        with self._state_lock:
+            self._message_id = 0xFFFF_FF00
+            self._last_message_id = None
+            self._rmt = 0
+            self._payload_remaining = 0
+            self._msg_type = ""
 
     def _discard_sync_input(self) -> None:
         """Drop anything sitting in the synchronous socket's receive buffer."""
@@ -990,23 +1035,27 @@ class Instrument:
             self._sync.setblocking(True)
             self._sync.settimeout(self._timeout)
 
-    def _await_interrupted(self, timeout: float = 2.0) -> bool:
-        """Read the sync channel until the server's Interrupted message.
+    def _read_sync_until(
+        self, msg_type: str, timeout: Optional[float] = None
+    ) -> RxHeader:
+        """Read sync-channel messages until one of *msg_type* arrives.
 
-        Returns True if it arrived, False if we gave up waiting.
+        Anything else — an ``Interrupted`` left over from a device clear, say
+        — is discarded. Waiting for the wanted message this way rather than
+        expecting it to be next avoids both a fixed settling delay and a
+        spurious protocol error when the server interleaves something.
+
         """
         saved_timeout = self._sync.gettimeout()
-        self._sync.settimeout(timeout)
+        if timeout is not None:
+            self._sync.settimeout(timeout)
         try:
             while True:
                 header = RxHeader(self._sync)
-                if header.msg_type == "Interrupted":
-                    return True
-                # Discard payload of any other messages
                 if header.payload_length > 0:
                     receive_flush(self._sync, header.payload_length)
-        except (socket.timeout, RuntimeError):
-            return False
+                if header.msg_type == msg_type:
+                    return header
         finally:
             self._sync.settimeout(saved_timeout)
 
@@ -1056,16 +1105,17 @@ class Instrument:
             #    partial HiSLIP message data in the buffer.
             self._discard_sync_input()
 
-            # 3. Full device clear: AsyncDeviceClear → Interrupted →
-            #    DeviceClearComplete → DeviceClearAcknowledge
+            # 3. Full device clear: AsyncDeviceClear → DeviceClearComplete →
+            #    DeviceClearAcknowledge. The server may or may not send an
+            #    Interrupted along the way; device_clear_complete skips it
+            #    rather than this waiting a fixed period for one that, on many
+            #    instruments, never comes.
             feature = self.async_device_clear()
-
-            # The server sends Interrupted after acknowledging AsyncDeviceClear.
-            # If it doesn't, proceed anyway — DeviceClearComplete still resets
-            # the protocol.
-            self._await_interrupted()
-
             self.device_clear_complete(feature)
+
+            # Drop an Interrupted that arrived after the acknowledge, so the
+            # next read does not mistake it for an abort.
+            self._discard_sync_input()
         finally:
             self._sync._cancel_enabled = True
 
@@ -1192,10 +1242,8 @@ class Instrument:
         #
         # The MessageID carried here is the id the next Data/DataEND/Trigger
         # message will use, matching other HiSLIP client implementations.
-        response = self.async_channel.transaction(
-            "AsyncStatusQuery", self._rmt, self._message_id
-        )
-        self._rmt = 0
+        rmt, message_id = self._consume_status_state()
+        response = self.async_channel.transaction("AsyncStatusQuery", rmt, message_id)
         return AsyncStatusResponse(response).server_status
 
     def async_device_clear(self) -> int:
@@ -1212,26 +1260,24 @@ class Instrument:
         returns the feature_bitmap from the DeviceClearAcknowledge packet.
         """
         send_msg(self._sync, "DeviceClearComplete", feature_bitmap, 0)
-        response = DeviceClearAcknowledge(self._sync)
-        return response.feature_bitmap
+        # The server may still be sending an Interrupted for a message that
+        # was in flight, so skip over anything that is not the acknowledge.
+        return self._read_sync_until("DeviceClearAcknowledge").control_code
 
     def trigger(self) -> None:
         """send a Trigger packet on the sync channel"""
-        send_msg(self._sync, "Trigger", self._rmt, self._message_id)
-        self.last_message_id = self._message_id
-        self._message_id = (self._message_id + 2) & 0xFFFF_FFFF
+        rmt, message_id = self._consume_send_state()
+        send_msg(self._sync, "Trigger", rmt, message_id)
 
     def _send_data_packet(self, payload: BytesBuffer) -> None:
         """send a Data packet on the sync channel"""
-        send_msg(self._sync, "Data", self._rmt, self._message_id, payload)
-        self.last_message_id = self._message_id
-        self._message_id = (self._message_id + 2) & 0xFFFF_FFFF
+        rmt, message_id = self._consume_send_state()
+        send_msg(self._sync, "Data", rmt, message_id, payload)
 
     def _send_data_end_packet(self, payload: BytesBuffer) -> None:
         """send a DataEnd packet on the sync channel"""
-        send_msg(self._sync, "DataEnd", self._rmt, self._message_id, payload)
-        self.last_message_id = self._message_id
-        self._message_id = (self._message_id + 2) & 0xFFFF_FFFF
+        rmt, message_id = self._consume_send_state()
+        send_msg(self._sync, "DataEnd", rmt, message_id, payload)
 
     def fatal_error(self, error: str, error_message: str = "") -> None:
         err_msg = (error_message or error).encode()

@@ -224,6 +224,7 @@ class TestInstrumentTerminate:
         mock_sync.recv.side_effect = BlockingIOError
         inst._sync = mock_sync
         inst._timeout = 5.0
+        inst._state_lock = threading.RLock()
         inst._message_id = 0xABCD
         inst._last_message_id = 0x1234
         inst._rmt = 1

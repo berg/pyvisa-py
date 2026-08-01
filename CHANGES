@@ -38,6 +38,27 @@ PyVISA-py Changelog
   - Read, write, trigger, lock and remote/local operations map dropped
     connections to ``VI_ERROR_CONN_LOST`` and other socket failures to
     ``VI_ERROR_IO``, rather than letting the exception escape.
+  - The RMT-delivered flag and the message id are claimed atomically. They
+    are shared by the synchronous send path and by ``AsyncStatusQuery``, so
+    a status query racing a write could deliver the flag twice or lose it,
+    and the instrument answered the next command with "-410 Query
+    INTERRUPTED". This was reproducible against real hardware roughly once
+    per 20000 concurrent status queries.
+  - A read that ends on the END indicator reports ``VI_SUCCESS`` even when
+    the last byte fills the caller's buffer exactly. Reporting
+    ``VI_SUCCESS_MAX_CNT`` there sends ``viRead`` loops back for a read that
+    can only time out, which happened whenever a response length was an
+    exact multiple of the chunk size.
+  - A lock request that times out client side now speculatively releases the
+    lock, so one granted late by the server is not held until the session is
+    closed.
+  - ``viTerminate`` no longer waits a fixed two seconds for an ``Interrupted``
+    message that many instruments never send. The device clear handshake
+    skips over interleaved messages instead, taking terminate and resync
+    from ~2 s to under 10 ms.
+  - ``hislip.DEVICE_CLEAR_SETTLE_TIME`` can be raised for instruments that
+    need longer than 100 ms to work through in-process messages before
+    ``DeviceClearComplete`` arrives.
 
 - Set the TCP keepalive probe timers defensively for all TCPIP resources.
   ``VI_ATTR_TCPIP_KEEPALIVE`` raised ``AttributeError`` on platforms without

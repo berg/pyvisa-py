@@ -370,14 +370,24 @@ class TCPIPInstrHiSLIP(Session):
             LOGGER.exception("Failed to read from the HiSLIP connection")
             return b"", StatusCode.error_io
 
+        # A DataEND message is the HiSLIP equivalent of the END indicator, and
+        # the interface reports it having been consumed through _rmt.
+        end_of_message = bool(self.interface._rmt)
+
         if term_byte and term_byte in data:
             self._pending_buffer.extend(data)
             return self._take_pending(count, term_byte)
 
+        # END wins over the byte count: when the last byte of a message
+        # happens to fill the caller's buffer exactly, reporting
+        # VI_SUCCESS_MAX_CNT would send viRead-style loops back for another
+        # read that can only time out.
+        if end_of_message:
+            return data, StatusCode.success
+
         if len(data) >= count:
             return data, StatusCode.success_max_count_read
 
-        # A DataEND message is the HiSLIP equivalent of the END indicator.
         return data, StatusCode.success
 
     def _take_pending(self, count: int, term_byte: bytes) -> Tuple[bytes, StatusCode]:
@@ -583,6 +593,15 @@ class TCPIPInstrHiSLIP(Session):
                 1e-3 * timeout, lock_string=lock_string
             )
         except socket.timeout:
+            # We gave up before the server answered, so we cannot tell whether
+            # it granted the lock. Release it, or a lock granted late would be
+            # held until the session is closed. Releasing a lock we do not hold
+            # is harmless: HiSLIP locks belong to the connection.
+            LOGGER.debug("HiSLIP lock request timed out, releasing speculatively")
+            try:
+                self.interface.async_lock_release()
+            except Exception:
+                LOGGER.debug("speculative lock release failed", exc_info=True)
             return "", StatusCode.error_timeout
         except hislip.HiSLIPConnectionLost:
             LOGGER.exception("HiSLIP connection lost while locking")

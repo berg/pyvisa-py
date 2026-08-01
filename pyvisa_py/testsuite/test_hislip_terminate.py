@@ -224,6 +224,7 @@ class TestInstrumentTerminate:
         mock_sync.recv.side_effect = BlockingIOError
         inst._sync = mock_sync
         inst._timeout = 5.0
+        inst._state_lock = threading.RLock()
         inst._message_id = 0xABCD
         inst._last_message_id = 0x1234
         inst._rmt = 1
@@ -319,10 +320,17 @@ class TestTCPIPInstrHiSLIPTerminate:
 
     def _make_session(self):
         """Create a TCPIPInstrHiSLIP with a mocked HiSLIP Instrument."""
+        from pyvisa.constants import ResourceAttribute
         from pyvisa_py.tcpip import TCPIPInstrHiSLIP
 
         sess = object.__new__(TCPIPInstrHiSLIP)
         sess.interface = MagicMock()
+        sess._pending_buffer = bytearray()
+        sess.attrs = {
+            ResourceAttribute.termchar: ord("\n"),
+            ResourceAttribute.termchar_enabled: False,
+            ResourceAttribute.send_end_enabled: True,
+        }
         return sess
 
     def test_terminate_calls_interface(self):
@@ -362,8 +370,8 @@ class TestTCPIPInstrHiSLIPTerminate:
         assert data == b""
         assert status == StatusCode.error_timeout
 
-    def test_read_success_rmt(self):
-        """read() returns success_termination_character_read when rmt is set."""
+    def test_read_end_of_message(self):
+        """A DataEND-terminated read is VI_SUCCESS, like any END indicator."""
         from pyvisa.constants import StatusCode
 
         sess = self._make_session()
@@ -372,7 +380,7 @@ class TestTCPIPInstrHiSLIPTerminate:
 
         data, status = sess.read(4096)
         assert data == b"*IDN? response\n"
-        assert status == StatusCode.success_termination_character_read
+        assert status == StatusCode.success
 
     def test_read_success_max_count(self):
         """read() returns success_max_count_read when buffer is full."""

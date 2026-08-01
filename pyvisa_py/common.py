@@ -8,7 +8,7 @@
 
 import logging
 import socket
-from typing import TYPE_CHECKING, Iterator, Optional
+from typing import TYPE_CHECKING, Iterator, Optional, Protocol
 
 from pyvisa import logger
 
@@ -20,6 +20,14 @@ if TYPE_CHECKING:
 else:
     BytesBuffer = bytes | bytearray | memoryview
     MutableBytesBuffer = bytearray | memoryview
+
+
+class SupportsRecvInto(Protocol):
+    """Anything that can fill a buffer the way ``socket.recv_into`` does."""
+
+    def recv_into(
+        self, buffer: MutableBytesBuffer, nbytes: int = ..., flags: int = ...
+    ) -> int: ...
 
 
 def set_keepalive(sock: socket.socket, keepalive: bool) -> None:

@@ -126,6 +126,16 @@ HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 
 DEFAULT_MAX_MSG_SIZE = 1 << 20  # from VISA spec
 
+#: The MessageID a client starts from; it steps by two per Data/DataEND/Trigger
+#: and is reset to this on initialization and device clear (IVI-6.1 3.1.2).
+INITIAL_MESSAGE_ID = 0xFFFF_FF00
+
+#: The MessageID standing for "no message sent yet". Messages that name the
+#: most recently sent Data/DataEND/Trigger use it before there has been one;
+#: IVI-6.1 writes it "0xffffff00-2" for both AsyncStatusQuery (6.14) and
+#: AsyncLock release (6.5).
+PRE_INITIAL_MESSAGE_ID = (INITIAL_MESSAGE_ID - 2) & 0xFFFF_FFFF
+
 #: Seconds to let in-process synchronous messages finish after the server
 #: acknowledges a device clear, before telling it the channel is clear.
 #: Some instruments need longer than this when several messages were sent
@@ -150,6 +160,30 @@ class HiSLIPConnectionLost(RuntimeError):
 
     Subclasses ``RuntimeError`` because that is what earlier versions of this
     module raised for a dropped connection.
+    """
+
+
+class HiSLIPUnrecognizedMessage(RuntimeError):
+    """A message this client cannot process, but which keeps us in sync.
+
+    IVI-6.1 6.3 requires the receiver to discard such a message and reply
+    with an Error on the channel it arrived on. Subclasses ``RuntimeError``
+    because that is what earlier versions raised.
+
+    """
+
+    def __init__(self, message_type: int, payload_length: int):
+        self.message_type = message_type
+        self.payload_length = payload_length
+        super().__init__(f"unrecognized message type: {message_type}")
+
+
+class HiSLIPSynchronizationLost(RuntimeError):
+    """Framing has failed and the connection can no longer be trusted.
+
+    IVI-6.1 6.2 requires a FatalError on both channels followed by closing
+    the connection.
+
     """
 
 
@@ -368,14 +402,12 @@ class RxHeader:
         ) = struct.unpack(HEADER_FORMAT, self.header)
 
         if prologue != b"HS":
-            # XXX we should send a 'Fatal Error' to the server, close the
-            # sockets, then raise an exception
-            raise RuntimeError("protocol synchronization error")
+            # Framing is gone; the caller sends a FatalError and closes.
+            raise HiSLIPSynchronizationLost("protocol synchronization error")
 
         if msg_type not in MESSAGETYPE_STR:
-            # XXX we should send 'Unrecognized message type' to the
-            #     server and discard this packet plus any payload.
-            raise RuntimeError("unrecognized message type: %d" % msg_type)
+            # Recoverable: the caller discards the payload and answers Error.
+            raise HiSLIPUnrecognizedMessage(msg_type, self.payload_length)
 
         self.msg_type = MESSAGETYPE_STR[msg_type]
 
@@ -401,7 +433,12 @@ class InitializeResponse(RxHeader):
     def __init__(self, sock: SupportsRecvInto) -> None:
         super().__init__(sock, "InitializeResponse")
         assert self.payload_length == 0
-        self.overlap = bool(self.control_code)
+        # IVI-6.1 6.1: bit 0 is overlap mode, bit 1 encryption mode, bit 2
+        # initial encryption. Reading the whole byte would mistake a server
+        # announcing mandatory encryption for one requesting overlapped mode.
+        self.overlap = bool(self.control_code & 0x01)
+        self.encryption_mandatory = bool(self.control_code & 0x02)
+        self.initial_encryption = bool(self.control_code & 0x04)
         self.version, self.session_id = struct.unpack("!4xHH8x", self.header)
 
 
@@ -561,6 +598,8 @@ class AsyncChannel:
         self._request_lock = threading.Lock()
         self._responses: "queue.Queue[Optional[bytes]]" = queue.Queue()
         self._srq_callback: Optional[Callable[[int], None]] = None
+        self._interrupted_callback: Optional[Callable[[int], None]] = None
+        self._async_interrupted = threading.Event()
         self._srq_lock = threading.Lock()
         # Service requests are handed to a second thread so that a callback
         # is free to talk to the instrument — the usual reaction to an SRQ is
@@ -695,6 +734,15 @@ class AsyncChannel:
                 msg_type, raw = message
                 if msg_type == "AsyncServiceRequest":
                     self._dispatch_srq(raw)
+                elif msg_type == "AsyncInterrupted":
+                    # Unsolicited, like a service request: the server sends it
+                    # when it abandons a response. Queueing it as a reply would
+                    # hand it to whichever transaction ran next.
+                    self._dispatch_interrupted(raw)
+                elif not msg_type:
+                    # Unrecognized but still framed: discard and say so, per
+                    # IVI-6.1 6.3, on the channel it arrived on.
+                    self._report_unrecognized(raw)
                 else:
                     self._responses.put(raw)
         finally:
@@ -716,10 +764,52 @@ class AsyncChannel:
 
         prologue, msg_type, _, _, payload_length = struct.unpack(HEADER_FORMAT, header)
         if prologue != b"HS":
-            raise HiSLIPConnectionLost("protocol synchronization error")
+            raise HiSLIPSynchronizationLost("protocol synchronization error")
 
         payload = receive_exact(self._sock, payload_length) if payload_length else b""
         return MESSAGETYPE_STR.get(msg_type, ""), bytes(header) + bytes(payload)
+
+    def _report_unrecognized(self, raw: bytes) -> None:
+        """Answer an unrecognized message with an Error, per IVI-6.1 6.3."""
+        message_type = raw[2] if len(raw) > 2 else 0
+        LOGGER.debug(
+            "unrecognized HiSLIP message type %d on the async channel", message_type
+        )
+        try:
+            with self._request_lock:
+                send_msg(
+                    self._sock,
+                    "Error",
+                    ERRORCODE["Unrecognized Message Type"],
+                    0,
+                    b"unrecognized message type",
+                )
+        except OSError:
+            LOGGER.debug("could not report the unrecognized message", exc_info=True)
+
+    def _dispatch_interrupted(self, raw: bytes) -> None:
+        """Note an AsyncInterrupted and release anyone waiting for one."""
+        with self._srq_lock:
+            callback = self._interrupted_callback
+        self._async_interrupted.set()
+        if callback is None:
+            return
+        try:
+            callback(AsyncInterrupted(BufferedMessage(raw)).message_id)
+        except Exception:
+            LOGGER.exception("error dispatching HiSLIP AsyncInterrupted")
+
+    def wait_for_async_interrupted(self, timeout: float) -> bool:
+        """Wait for an AsyncInterrupted, returning whether one arrived.
+
+        IVI-6.1 3.1.2 rule 4: a client that saw Interrupted first must not
+        send anything more until the matching AsyncInterrupted arrives.
+
+        """
+        return self._async_interrupted.wait(timeout)
+
+    def clear_async_interrupted(self) -> None:
+        self._async_interrupted.clear()
 
     def _dispatch_srq(self, raw: bytes) -> None:
         """Queue a service request for the worker thread to deliver."""
@@ -777,11 +867,13 @@ class Instrument:
         # Message state has to exist before any I/O: initialize() and the
         # async channel reader may both touch it.
         self._rmt = 0
-        self._message_id = 0xFFFF_FF00
+        self._message_id = INITIAL_MESSAGE_ID
         self._last_message_id: Optional[int] = None
         self._msg_type: str = ""
         self._payload_remaining: int = 0
         self._receiving = threading.Event()
+        #: An Interrupted arrived and its AsyncInterrupted has not yet.
+        self._interrupted_pending = False
         # Guards the message bookkeeping shared by the synchronous send path
         # and the asynchronous status query.
         self._state_lock = threading.RLock()
@@ -896,6 +988,16 @@ class Instrument:
         "-410 Query INTERRUPTED".
 
         """
+        # IVI-6.1 3.1.2 rule 3: any whole or partial server message still
+        # buffered is stale once we send, so drop it rather than let it be
+        # parsed as the next response. Only needed when a previous read was
+        # abandoned part way; the normal read-to-completion path has nothing
+        # outstanding.
+        with self._state_lock:
+            stale = self._payload_remaining > 0 or self._msg_type not in ("", "DataEnd")
+        if stale:
+            self._discard_sync_input()
+
         with self._state_lock:
             rmt, message_id = self._rmt, self._message_id
             self._rmt = 0
@@ -909,13 +1011,30 @@ class Instrument:
         """As :meth:`_consume_send_state`, for an AsyncStatusQuery.
 
         A status query reports the RMT flag but does not consume a message
-        id, so the id is not advanced.
+        id, so the id is not advanced. The id it carries is the *most recently
+        sent* Data/DataEND/Trigger, not the next one: per IVI-6.1 6.14.3 the
+        server compares it with the last message it received and reports MAV
+        false when they differ, so sending the next id suppresses MAV on every
+        status query.
 
         """
         with self._state_lock:
-            rmt, message_id = self._rmt, self._message_id
+            rmt = self._rmt
+            message_id = self.most_recent_message_id
             self._rmt = 0
         return rmt, message_id
+
+    @property
+    def most_recent_message_id(self) -> int:
+        """MessageID of the last Data/DataEND/Trigger sent on this connection.
+
+        AsyncStatusQuery, AsyncLock release and AsyncRemoteLocalControl all
+        name it, and all use :data:`PRE_INITIAL_MESSAGE_ID` until this client
+        has sent one.
+
+        """
+        last = self._last_message_id
+        return PRE_INITIAL_MESSAGE_ID if last is None else last
 
     @property
     def keepalive(self) -> bool:
@@ -952,6 +1071,7 @@ class Instrument:
 
         """
         # print(f"send({data=})")  # uncomment for debugging
+        self._await_async_interrupted()
         data_view = memoryview(data)
         num_bytes_to_send = len(data)
         max_payload_size = self._max_msg_size - HEADER_SIZE
@@ -1033,7 +1153,17 @@ class Instrument:
         message_id, and return the msg_type and payload_length.
         """
         while True:
-            header = RxHeader(self._sync)
+            try:
+                header = RxHeader(self._sync)
+            except HiSLIPUnrecognizedMessage as unknown:
+                # IVI-6.1 6.3: discard it, answer Error, carry on.
+                receive_flush(self._sync, unknown.payload_length)
+                self.report_unrecognized_message()
+                continue
+            except HiSLIPSynchronizationLost:
+                # IVI-6.1 6.2: FatalError on both channels, then close.
+                self.report_fatal_error("Poorly formed message header")
+                raise
 
             if header.msg_type in ("Data", "DataEnd"):
                 # When receiving Data messages if the MessageID is not 0xffff ffff,
@@ -1051,9 +1181,10 @@ class Instrument:
                     break
 
             if header.msg_type == "Interrupted":
-                # Server sent Interrupted in response to AsyncDeviceClear.
-                # Per IVI-6.1, the client should discard buffered data and
-                # signal the abort to the caller.
+                # The server abandoned the response. IVI-6.1 3.1.2 rule 4: if
+                # we see this before the matching AsyncInterrupted, we must
+                # not send anything more until that arrives.
+                self._interrupted_pending = True
                 raise HiSLIPInterruptedError(header.message_parameter)
 
             if header.msg_type in ("Error", "FatalError"):
@@ -1082,14 +1213,51 @@ class Instrument:
         # reset messageID and resume normal operation
         self._reset_message_state()
 
+    def report_unrecognized_message(self) -> None:
+        """Answer an unrecognized synchronous message with an Error.
+
+        Required by IVI-6.1 6.3, on the channel the message arrived on.
+        """
+        try:
+            self.error("Unrecognized Message Type")
+        except OSError:
+            LOGGER.debug("could not report the unrecognized message", exc_info=True)
+
+    def report_fatal_error(self, error: str) -> None:
+        """Send a FatalError on both channels, as IVI-6.1 6.2 requires."""
+        payload = error.encode()
+        code = FATALERRORCODE.get(error, 0)
+        for sock in (self._sync, self._async):
+            try:
+                send_msg(sock, "FatalError", code, 0, payload)
+            except OSError:
+                LOGGER.debug("could not send FatalError", exc_info=True)
+
+    def _await_async_interrupted(self) -> None:
+        """Hold off sending until a pending Interrupted has been paired.
+
+        IVI-6.1 3.1.2 rule 4. Bounded by the session timeout: a server that
+        never sends the AsyncInterrupted should not wedge the client forever.
+        """
+        if not self._interrupted_pending:
+            return
+        self._interrupted_pending = False
+        channel = self._async_channel
+        if channel is None:
+            return
+        if not channel.wait_for_async_interrupted(min(self._timeout or 5.0, 5.0)):
+            LOGGER.debug("no AsyncInterrupted followed the Interrupted message")
+        channel.clear_async_interrupted()
+
     def _reset_message_state(self) -> None:
         """Return the message bookkeeping to its just-connected state."""
         with self._state_lock:
-            self._message_id = 0xFFFF_FF00
+            self._message_id = INITIAL_MESSAGE_ID
             self._last_message_id = None
             self._rmt = 0
             self._payload_remaining = 0
             self._msg_type = ""
+            self._interrupted_pending = False
 
     def _discard_sync_input(self) -> None:
         """Drop anything sitting in the synchronous socket's receive buffer."""
@@ -1290,7 +1458,7 @@ class Instrument:
         #     S->C: AsyncLockResponse
         ctrl_code = LOCKCONTROLCODE["release"]
         response = self.async_channel.transaction(
-            "AsyncLock", ctrl_code, self.last_message_id
+            "AsyncLock", ctrl_code, self.most_recent_message_id
         )
         return AsyncLockResponse(response).lock_response
 
@@ -1304,7 +1472,7 @@ class Instrument:
         ctrl_code = REMOTELOCALCONTROLCODE[remotelocalcontrol]
         AsyncRemoteLocalResponse(
             self.async_channel.transaction(
-                "AsyncRemoteLocalControl", ctrl_code, self.last_message_id
+                "AsyncRemoteLocalControl", ctrl_code, self.most_recent_message_id
             )
         )
 
@@ -1343,6 +1511,7 @@ class Instrument:
 
     def trigger(self) -> None:
         """send a Trigger packet on the sync channel"""
+        self._await_async_interrupted()
         rmt, message_id = self._consume_send_state()
         send_msg(self._sync, "Trigger", rmt, message_id)
 

@@ -72,6 +72,32 @@ PyVISA-py Changelog
     ``FatalError``). This applies to the asynchronous channel too, so a
     refused status query, device clear or remote/local request fails
     immediately rather than at the timeout.
+  - Cross-checked the implementation against IVI-6.1 revision 2.0 and fixed
+    what it turned up:
+
+    - ``AsyncStatusQuery`` carried the wrong MessageID. Section 6.14 requires
+      the id of the *most recently sent* Data/DataEND/Trigger, and
+      ``0xffffff00-2`` before there has been one; pyvisa-py sent the id it
+      would use *next*. Since 6.14.3 has the server report MAV false whenever
+      that id does not match the last message it received, ``viReadSTB``
+      never reported message-available against a conformant instrument.
+      ``AsyncLock`` release and ``AsyncRemoteLocalControl`` name the same id
+      and share the corrected default.
+    - ``AsyncInterrupted`` was not demultiplexed on the asynchronous channel,
+      so it was handed back as the response to whichever transaction ran
+      next. It is now dispatched like a service request, and the client waits
+      for it after an ``Interrupted`` as section 3.1.2 rule 4 requires.
+    - An unrecognised message is now answered with ``Error`` and a framing
+      failure with ``FatalError`` on both channels, per sections 6.3 and 6.2.
+      Both were previously ``RuntimeError`` with an ``XXX`` comment.
+    - ``InitializeResponse`` read the whole control code as the overlap-mode
+      flag. Only bit 0 is overlap; bits 1 and 2 announce encryption
+      requirements, so a server demanding encryption looked like one asking
+      for overlapped mode.
+    - Whole or partial server messages left buffered are now discarded when
+      the client sends, per section 3.1.2 rule 3, instead of being parsed as
+      the next response.
+
   - Constructing ``hislip.Error`` or ``hislip.FatalError`` with a control code
     in the device-defined range 128-255 raised ``KeyError``: the lookup tables
     stop at the protocol-defined codes even though both carry a comment

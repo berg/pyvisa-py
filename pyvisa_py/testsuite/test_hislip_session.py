@@ -111,6 +111,20 @@ class FakeHiSLIPServer:
         for thread in self._threads:
             thread.join(timeout=2.0)
 
+    def send_async_interrupted(self, message_id=0xFFFF_FF00):
+        """Push an unsolicited AsyncInterrupted to the client."""
+        assert self._async_ready.wait(5.0), "async channel never connected"
+        self._async_sock.sendall(_pack("AsyncInterrupted", 0, message_id))
+
+    def send_unrecognized(self, channel="async", message_type=120):
+        """Send a message with a type no client can know."""
+        header = struct.pack(hislip.HEADER_FORMAT, b"HS", message_type, 0, 0, 0)
+        if channel == "async":
+            assert self._async_ready.wait(5.0)
+            self._async_sock.sendall(header)
+        else:
+            self._sync_sock.sendall(header)
+
     def send_service_request(self, status_byte=0x40):
         """Push an unsolicited AsyncServiceRequest to the client."""
         assert self._async_ready.wait(5.0), "async channel never connected"
@@ -469,6 +483,88 @@ class TestLocking:
 
     def test_unlock_without_lock(self, session):
         assert session.unlock() == StatusCode.error_session_not_locked
+
+
+class TestSpecConformance:
+    """Client-side rules from IVI-6.1 that are easy to get subtly wrong."""
+
+    def test_status_query_names_the_most_recent_message(self, session, server):
+        """6.14: the id is the most recently *sent* message, not the next one.
+
+        6.14.3 has the server report MAV false when the id does not match the
+        last message it received, so sending the next id suppresses MAV.
+        """
+        session.write(b"*IDN?\n")
+        session.read(4096)
+        sent = [e for e in server.sync_log if e[0] == "DataEnd"][-1][2]
+
+        session.read_stb()
+        query = [e for e in server.async_log if e[0] == "AsyncStatusQuery"][-1]
+        assert query[2] == sent, (
+            f"AsyncStatusQuery carried {query[2]:#x}, the last DataEND was {sent:#x}"
+        )
+
+    def test_status_query_before_any_write(self, session, server):
+        """6.14: use 0xffffff00-2 until a message has been sent."""
+        session.read_stb()
+        query = [e for e in server.async_log if e[0] == "AsyncStatusQuery"][-1]
+        assert query[2] == hislip.PRE_INITIAL_MESSAGE_ID
+
+    def test_lock_release_names_the_most_recent_message(self, session, server):
+        """6.5: the release names the last message to complete first."""
+        session.lock(constants.Lock.exclusive, 1000)
+        session.unlock()
+        release = [
+            e
+            for e in server.async_log
+            if e[0] == "AsyncLock" and e[1] == hislip.LOCKCONTROLCODE["release"]
+        ][-1]
+        assert release[2] == hislip.PRE_INITIAL_MESSAGE_ID
+
+    def test_async_interrupted_is_not_taken_for_a_response(self, session, server):
+        """6.11: AsyncInterrupted is unsolicited and must not answer a query."""
+        server.send_async_interrupted()
+        time.sleep(0.2)
+        # The status query that follows must get the real status byte.
+        server.status_byte = 0x18
+        stb, status = session.read_stb()
+        assert status == StatusCode.success
+        assert stb == 0x18
+
+    def test_unrecognized_async_message_is_answered_with_error(self, session, server):
+        """6.3: discard it and reply with an Error on the same channel."""
+        server.send_unrecognized(channel="async")
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            if any(e[0] == "Error" for e in server.async_log):
+                break
+            time.sleep(0.02)
+        errors = [e for e in server.async_log if e[0] == "Error"]
+        assert errors, "no Error was sent back"
+        assert errors[-1][1] == hislip.ERRORCODE["Unrecognized Message Type"]
+        # and the channel still works
+        assert session.read_stb()[1] == StatusCode.success
+
+    def test_overlap_flag_reads_only_bit_zero(self):
+        """6.1: bit 0 is overlap; bits 1-2 are encryption announcements."""
+        header = _pack("InitializeResponse", 0b110, (0x0100 << 16) | SESSION_ID)
+        response = hislip.InitializeResponse(hislip.BufferedMessage(header))
+        assert response.overlap is False
+        assert response.encryption_mandatory is True
+        assert response.initial_encryption is True
+
+    def test_partial_response_is_dropped_before_the_next_write(self, session, server):
+        """3.1.2 rule 3: buffered server messages are cleared when we send."""
+        server.response = b"0123456789" * 8
+        session.write(b"*IDN?\n")
+        first, _ = session.read(10)  # abandon the rest
+        assert first == b"0123456789"
+
+        # The leftovers must not be parsed as the reply to this next query.
+        session.write(b"*IDN?\n")
+        data, status = session.read(4096)
+        assert data == server.response
+        assert status == StatusCode.success
 
 
 class TestServerRefusal:

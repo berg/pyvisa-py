@@ -126,6 +126,10 @@ HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 
 DEFAULT_MAX_MSG_SIZE = 1 << 20  # from VISA spec
 
+#: Seconds to allow for the TCP connection when the caller did not ask for a
+#: particular open timeout.
+DEFAULT_CONNECT_TIMEOUT = 5.0
+
 #: The MessageID a client starts from; it steps by two per Data/DataEND/Trigger
 #: and is reset to this on initialization and device clear (IVI-6.1 3.1.2).
 INITIAL_MESSAGE_ID = 0xFFFF_FF00
@@ -861,8 +865,14 @@ class Instrument:
 
         timeout = timeout or 5.0
         # ``open_timeout`` is expressed in milliseconds, like the VISA
-        # attribute it comes from.
-        connect_timeout = 5.0 if open_timeout is None else 1e-3 * open_timeout
+        # attribute it comes from. Both None and 0 mean "no preference": 0 is
+        # VI_TMO_IMMEDIATE and, more to the point, is what
+        # ``ResourceManager.open_resource`` passes when the caller says
+        # nothing, so taking it literally would make every default open fail
+        # on a non-blocking connect. TCPIPSocketSession treats it the same way.
+        connect_timeout = (
+            1e-3 * open_timeout if open_timeout else DEFAULT_CONNECT_TIMEOUT
+        )
 
         # Message state has to exist before any I/O: initialize() and the
         # async channel reader may both touch it.

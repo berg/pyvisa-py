@@ -34,7 +34,11 @@ PyVISA-py Changelog
     message could previously desynchronise the next read.
   - ``open_timeout`` is applied to the connection attempt. It was accepted
     and then ignored, and was also scaled as though it were in seconds when
-    it is in milliseconds.
+    it is in milliseconds. Both ``None`` and ``0`` mean "no preference" and
+    fall back to a five second connect, matching TCPIPSocketSession: 0 is
+    VI_TMO_IMMEDIATE and is what ``ResourceManager.open_resource`` passes
+    when the caller does not ask for one, so taking it literally would make
+    every default open fail on a non-blocking connect.
   - Read, write, trigger, lock and remote/local operations map dropped
     connections to ``VI_ERROR_CONN_LOST`` and other socket failures to
     ``VI_ERROR_IO``, rather than letting the exception escape.

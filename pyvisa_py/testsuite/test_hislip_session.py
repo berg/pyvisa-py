@@ -485,6 +485,29 @@ class TestLocking:
         assert session.unlock() == StatusCode.error_session_not_locked
 
 
+class TestOpenTimeout:
+    """The default open path must work, which is the one nobody passes.
+
+    ``ResourceManager.open_resource`` defaults open_timeout to
+    VI_TMO_IMMEDIATE (0). Taking that literally as a socket timeout makes the
+    connect non-blocking and every default open fail.
+    """
+
+    @pytest.mark.parametrize("open_timeout", [None, 0, 5000])
+    def test_open_succeeds_for_any_open_timeout(self, server, open_timeout):
+        sess = TCPIPInstrHiSLIP(
+            0,
+            f"TCPIP0::127.0.0.1::hislip0,{server.port}::INSTR",
+            open_timeout=open_timeout,
+        )
+        try:
+            sess.write(b"*IDN?\n")
+            data, _ = sess.read(4096)
+            assert data == server.response
+        finally:
+            sess.close()
+
+
 class TestSpecConformance:
     """Client-side rules from IVI-6.1 that are easy to get subtly wrong."""
 

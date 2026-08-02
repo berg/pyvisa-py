@@ -72,6 +72,11 @@ class FakeHiSLIPServer:
         self.response = response
         self.status_byte = status_byte
         self.lock_response = "success"
+        #: When set to a control code, refuse traffic with an Error carrying
+        #: it. An Error is the only way a server can report a failed
+        #: transaction.
+        self.refuse_with = None
+        self.refuse_message = b"operation refused by the server"
         #: Messages received on the async channel, for assertions.
         self.async_log = []
         #: Messages received on the sync channel, for assertions.
@@ -151,7 +156,15 @@ class FakeHiSLIPServer:
                 msg_type, control, parameter, payload = message
                 self.sync_log.append((msg_type, control, parameter, payload))
 
-                if msg_type == "DataEnd" and not self.mute:
+                if self.refuse_with is not None and msg_type in (
+                    "DataEnd",
+                    "Data",
+                    "Trigger",
+                ):
+                    sock.sendall(
+                        _pack("Error", self.refuse_with, 0, self.refuse_message)
+                    )
+                elif msg_type == "DataEnd" and not self.mute:
                     sock.sendall(_pack("DataEnd", 0, parameter, self.response))
                 elif msg_type == "DeviceClearComplete":
                     sock.sendall(_pack("DeviceClearAcknowledge", control))
@@ -174,7 +187,15 @@ class FakeHiSLIPServer:
                 msg_type, control, parameter, payload = message
                 self.async_log.append((msg_type, control, parameter, payload))
 
-                if msg_type == "AsyncMaxMsgSize":
+                if self.refuse_with is not None and msg_type in (
+                    "AsyncDeviceClear",
+                    "AsyncStatusQuery",
+                    "AsyncRemoteLocalControl",
+                ):
+                    sock.sendall(
+                        _pack("Error", self.refuse_with, 0, self.refuse_message)
+                    )
+                elif msg_type == "AsyncMaxMsgSize":
                     requested = struct.unpack("!Q", payload)[0]
                     sock.sendall(
                         _pack(
@@ -448,6 +469,98 @@ class TestLocking:
 
     def test_unlock_without_lock(self, session):
         assert session.unlock() == StatusCode.error_session_not_locked
+
+
+class TestServerRefusal:
+    """A server refuses an operation with an Error; it must not read as a timeout.
+
+    An Error is the only way a HiSLIP server can report a failed transaction.
+    Dropping it leaves the caller waiting out its timeout with no diagnostic
+    for a condition the server described exactly.
+    """
+
+    def test_refused_read_reports_an_error(self, session, server):
+        server.refuse_with = 128
+        session.write(b"*IDN?\n")
+        data, status = session.read(4096)
+        assert data == b""
+        assert status == StatusCode.error_io
+
+    def test_refused_read_is_prompt(self, session, server):
+        """The refusal must not wait for the timeout to expire."""
+        server.refuse_with = 128
+        session.set_attribute(ResourceAttribute.timeout_value, 10000)
+        session.write(b"*IDN?\n")
+        start = time.time()
+        _, status = session.read(4096)
+        assert status == StatusCode.error_io
+        assert time.time() - start < 2.0, "the refusal waited for the timeout"
+
+    @pytest.mark.parametrize("code", [0, 4, 128, 200, 255])
+    def test_any_error_code_is_handled(self, session, server, code):
+        """Device-defined codes carry no portable meaning, but must not crash."""
+        server.refuse_with = code
+        session.write(b"*IDN?\n")
+        _, status = session.read(4096)
+        assert status == StatusCode.error_io
+
+    def test_refused_trigger(self, session, server):
+        server.refuse_with = 128
+        session.write(b"*IDN?\n")
+        session.read(4096)
+        # The refusal to the Trigger surfaces on the next read of the channel.
+        assert session.assert_trigger(constants.TriggerProtocol.default) in (
+            StatusCode.success,
+            StatusCode.error_io,
+        )
+
+    def test_refused_async_transaction_reports_an_error(self, session, server):
+        """The same on the asynchronous channel."""
+        server.refuse_with = 128
+        _stb, status = session.read_stb()
+        assert status == StatusCode.error_io
+
+    def test_refused_async_transaction_is_prompt(self, session, server):
+        server.refuse_with = 128
+        session.set_attribute(ResourceAttribute.timeout_value, 10000)
+        start = time.time()
+        _, status = session.read_stb()
+        assert status == StatusCode.error_io
+        assert time.time() - start < 2.0, "the refusal waited for the timeout"
+
+    def test_refused_device_clear(self, session, server):
+        server.refuse_with = 128
+        assert session.clear() == StatusCode.error_io
+
+    def test_device_defined_codes_do_not_raise_keyerror(self):
+        """ERRORMESSAGE stops at 5; the device-defined range must still name."""
+        assert "128" in hislip.describe_error(128, fatal=False)
+        assert "200" in hislip.describe_error(200, fatal=True)
+        for code in (0, 1, 5):
+            assert hislip.describe_error(code, fatal=False) == hislip.ERRORMESSAGE[code]
+
+    def test_error_carries_the_server_explanation(self, session, server):
+        """The payload is the only diagnostic there is; keep it."""
+        server.refuse_with = 128
+        server.refuse_message = b"operation refused by the server"
+        session.write(b"*IDN?\n")
+        try:
+            session.interface.receive(4096)
+        except hislip.HiSLIPServerError as exc:
+            assert "operation refused by the server" in str(exc)
+            assert exc.control_code == 128
+            assert not exc.fatal
+        else:
+            raise AssertionError("no HiSLIPServerError raised")
+
+    def test_fatal_error_reports_connection_lost(self):
+        """A FatalError means the server is tearing the link down."""
+        from pyvisa_py.tcpip import hislip_error_to_status
+
+        fatal = hislip.HiSLIPServerError(3, "invalid init", fatal=True)
+        assert hislip_error_to_status(fatal) == StatusCode.error_connection_lost
+        non_fatal = hislip.HiSLIPServerError(128, "refused", fatal=False)
+        assert hislip_error_to_status(non_fatal) == StatusCode.error_io
 
 
 class TestMessageStateRace:

@@ -153,6 +153,27 @@ class HiSLIPConnectionLost(RuntimeError):
     """
 
 
+class HiSLIPServerError(Exception):
+    """Raised when the server reports an Error or FatalError message.
+
+    This is how a HiSLIP server refuses a transaction — there is no dedicated
+    "operation refused" message — so the control code and the human readable
+    payload are both kept for the session layer to map and report.
+
+    Control codes 128-255 are device defined and carry no meaning fixed by
+    the protocol; ``description`` is the server's own words for what went
+    wrong.
+
+    """
+
+    def __init__(self, control_code: int, description: str, fatal: bool = False):
+        self.control_code = control_code
+        self.description = description
+        self.fatal = fatal
+        kind = "fatal error" if fatal else "error"
+        super().__init__(f"HiSLIP {kind} {control_code}: {description}")
+
+
 class CancellableSocket(socket.socket):
     """Socket subclass that supports cross-thread cancellation via select().
 
@@ -270,6 +291,35 @@ def receive_exact_into(sock: SupportsRecvInto, recv_buffer: MutableBytesBuffer) 
 
     if bytes_recvd > recv_len:
         raise MemoryError("socket.recv_into scribbled past end of recv_buffer")
+
+
+def describe_error(control_code: int, fatal: bool) -> str:
+    """Name a HiSLIP error control code, including the device defined range."""
+    table = FATALERRORMESSAGE if fatal else ERRORMESSAGE
+    kind = "fatal error" if fatal else "error"
+    return table.get(control_code, f"device defined {kind} {control_code}")
+
+
+def error_from_header(sock: SupportsRecvInto, header: "RxHeader") -> HiSLIPServerError:
+    """Read the payload of an already-received Error/FatalError and describe it.
+
+    The payload is the server's explanation, so it is worth carrying rather
+    than discarding — for a refusal it is the only diagnostic there is.
+
+    """
+    fatal = header.msg_type == "FatalError"
+    detail = ""
+    if header.payload_length:
+        try:
+            detail = bytes(receive_exact(sock, header.payload_length)).decode(
+                "utf-8", "replace"
+            )
+        except (OSError, RuntimeError):
+            detail = ""
+    name = describe_error(header.control_code, fatal)
+    return HiSLIPServerError(
+        header.control_code, f"{name}: {detail}" if detail else name, fatal
+    )
 
 
 def send_msg(
@@ -448,7 +498,10 @@ class Interrupted(RxHeader):
 class Error(RxHeader):
     def __init__(self, sock: SupportsRecvInto) -> None:
         super().__init__(sock, "Error")
-        self.error_code = ERRORMESSAGE[self.control_code]
+        # 128-255 are device defined, so there is no name to look up.
+        self.error_code = ERRORMESSAGE.get(
+            self.control_code, f"device defined error {self.control_code}"
+        )
         assert self.message_parameter == 0
         self.error_message = receive_exact(sock, self.payload_length)
 
@@ -456,7 +509,10 @@ class Error(RxHeader):
 class FatalError(RxHeader):
     def __init__(self, sock: SupportsRecvInto) -> None:
         super().__init__(sock, "FatalError")
-        self.error_code = FATALERRORMESSAGE[self.control_code]
+        # 128-255 are device defined, so there is no name to look up.
+        self.error_code = FATALERRORMESSAGE.get(
+            self.control_code, f"device defined fatal error {self.control_code}"
+        )
         assert self.message_parameter == 0
         self.error_message = receive_exact(sock, self.payload_length)
 
@@ -590,7 +646,15 @@ class AsyncChannel:
             raise HiSLIPConnectionLost(
                 "the asynchronous channel was closed by the server"
             )
-        return BufferedMessage(response)
+
+        reader = BufferedMessage(response)
+        # The server answers a refused asynchronous request with an Error
+        # rather than the response type we asked for. Recognise it here, or
+        # the response class raises an opaque synchronization error.
+        header = RxHeader(BufferedMessage(response))
+        if header.msg_type in ("Error", "FatalError"):
+            raise error_from_header(BufferedMessage(response[HEADER_SIZE:]), header)
+        return reader
 
     def _discard_stale_responses(self) -> None:
         """Drop queued responses left over from a request that timed out."""
@@ -992,6 +1056,14 @@ class Instrument:
                 # signal the abort to the caller.
                 raise HiSLIPInterruptedError(header.message_parameter)
 
+            if header.msg_type in ("Error", "FatalError"):
+                # The server is refusing the transaction — there is no
+                # dedicated message for that, so this is the only way it can
+                # say so. Discarding it here would leave the read waiting for
+                # a reply that is never coming, and the caller would see a
+                # timeout instead of the reason.
+                raise error_from_header(self._sync, header)
+
             # we're out of sync.  flush this message and continue.
             receive_flush(self._sync, header.payload_length)
 
@@ -1052,6 +1124,11 @@ class Instrument:
         try:
             while True:
                 header = RxHeader(self._sync)
+                if header.msg_type in ("Error", "FatalError") and msg_type not in (
+                    "Error",
+                    "FatalError",
+                ):
+                    raise error_from_header(self._sync, header)
                 if header.payload_length > 0:
                     receive_flush(self._sync, header.payload_length)
                 if header.msg_type == msg_type:

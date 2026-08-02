@@ -59,6 +59,23 @@ PyVISA-py Changelog
   - ``hislip.DEVICE_CLEAR_SETTLE_TIME`` can be raised for instruments that
     need longer than 100 ms to work through in-process messages before
     ``DeviceClearComplete`` arrives.
+  - An ``Error`` or ``FatalError`` from the server is now reported instead of
+    being discarded. HiSLIP has no dedicated "operation refused" message, so
+    an ``Error`` is the only way a server can report a failed transaction —
+    a refused write, a query the instrument never answered, or I/O from a
+    session that does not hold the lock. Both were previously flushed as
+    unrecognised traffic, leaving the read waiting for a reply that was never
+    coming and the caller seeing ``VI_ERROR_TIMEOUT`` with no diagnostic for a
+    condition the server had described exactly. They now raise
+    ``hislip.HiSLIPServerError``, carrying the server's own explanation, which
+    the session maps to ``VI_ERROR_IO`` (or ``VI_ERROR_CONN_LOST`` for a
+    ``FatalError``). This applies to the asynchronous channel too, so a
+    refused status query, device clear or remote/local request fails
+    immediately rather than at the timeout.
+  - Constructing ``hislip.Error`` or ``hislip.FatalError`` with a control code
+    in the device-defined range 128-255 raised ``KeyError``: the lookup tables
+    stop at the protocol-defined codes even though both carry a comment
+    reserving the upper range. They now fall back to a generated description.
 
 - Set the TCP keepalive probe timers defensively for all TCPIP resources.
   ``VI_ATTR_TCPIP_KEEPALIVE`` raised ``AttributeError`` on platforms without

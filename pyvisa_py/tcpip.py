@@ -119,6 +119,23 @@ HISLIP_REMOTE_LOCAL_CONTROL = {
 }
 
 
+def hislip_error_to_status(error: hislip.HiSLIPServerError) -> StatusCode:
+    """Map a server-reported HiSLIP error onto a VISA status code.
+
+    The protocol defines error codes 0-5 and leaves 128-255 to the device, so
+    there is no portable way to tell what a given code means — two servers can
+    use the same number for unrelated conditions. Everything non-fatal is
+    therefore reported as VI_ERROR_IO, with the server's own description
+    carried on the exception and into the log, which is the part that actually
+    tells the caller what happened.
+
+    """
+    if error.fatal:
+        # A FatalError means the server is tearing the connection down.
+        return StatusCode.error_connection_lost
+    return StatusCode.error_io
+
+
 #: Conversion between HiSLIP AsyncLockResponse control codes and VISA status.
 HISLIP_LOCK_ERRORS_TO_VISA = {
     "success": StatusCode.success,
@@ -362,6 +379,10 @@ class TCPIPInstrHiSLIP(Session):
         except socket.timeout:
             return b"", StatusCode.error_timeout
 
+        except hislip.HiSLIPServerError as error:
+            LOGGER.debug("HiSLIP server refused the read: %s", error)
+            return b"", hislip_error_to_status(error)
+
         except hislip.HiSLIPConnectionLost:
             LOGGER.exception("HiSLIP connection lost while reading")
             return b"", StatusCode.error_connection_lost
@@ -428,6 +449,9 @@ class TCPIPInstrHiSLIP(Session):
             self.interface.send(data, end=bool(send_end))
         except socket.timeout:
             return 0, StatusCode.error_timeout
+        except hislip.HiSLIPServerError as error:
+            LOGGER.debug("HiSLIP server refused the write: %s", error)
+            return 0, hislip_error_to_status(error)
         except hislip.HiSLIPConnectionLost:
             LOGGER.exception("HiSLIP connection lost while writing")
             return 0, StatusCode.error_connection_lost
@@ -444,7 +468,16 @@ class TCPIPInstrHiSLIP(Session):
 
         """
         self._pending_buffer.clear()
-        self.interface.device_clear()
+        try:
+            self.interface.device_clear()
+        except socket.timeout:
+            return StatusCode.error_timeout
+        except hislip.HiSLIPServerError as error:
+            LOGGER.debug("HiSLIP server refused the device clear: %s", error)
+            return hislip_error_to_status(error)
+        except hislip.HiSLIPConnectionLost:
+            LOGGER.exception("HiSLIP connection lost during device clear")
+            return StatusCode.error_connection_lost
 
         return StatusCode.success
 
@@ -502,6 +535,9 @@ class TCPIPInstrHiSLIP(Session):
             self.interface.trigger()
         except socket.timeout:
             return StatusCode.error_timeout
+        except hislip.HiSLIPServerError as error:
+            LOGGER.debug("HiSLIP server refused the trigger: %s", error)
+            return hislip_error_to_status(error)
         except hislip.HiSLIPConnectionLost:
             LOGGER.exception("HiSLIP connection lost while triggering")
             return StatusCode.error_connection_lost
@@ -539,6 +575,9 @@ class TCPIPInstrHiSLIP(Session):
             self.interface.async_remote_local_control(control)
         except socket.timeout:
             return StatusCode.error_timeout
+        except hislip.HiSLIPServerError as error:
+            LOGGER.debug("HiSLIP server refused remote/local control: %s", error)
+            return hislip_error_to_status(error)
         except hislip.HiSLIPConnectionLost:
             LOGGER.exception("HiSLIP connection lost during remote/local control")
             return StatusCode.error_connection_lost
@@ -603,6 +642,9 @@ class TCPIPInstrHiSLIP(Session):
             except Exception:
                 LOGGER.debug("speculative lock release failed", exc_info=True)
             return "", StatusCode.error_timeout
+        except hislip.HiSLIPServerError as error:
+            LOGGER.debug("HiSLIP server refused the lock request: %s", error)
+            return "", hislip_error_to_status(error)
         except hislip.HiSLIPConnectionLost:
             LOGGER.exception("HiSLIP connection lost while locking")
             return "", StatusCode.error_connection_lost
@@ -639,6 +681,9 @@ class TCPIPInstrHiSLIP(Session):
             response = self.interface.async_lock_release()
         except socket.timeout:
             return StatusCode.error_timeout
+        except hislip.HiSLIPServerError as error:
+            LOGGER.debug("HiSLIP server refused the lock release: %s", error)
+            return hislip_error_to_status(error)
         except hislip.HiSLIPConnectionLost:
             LOGGER.exception("HiSLIP connection lost while unlocking")
             return StatusCode.error_connection_lost
@@ -668,10 +713,18 @@ class TCPIPInstrHiSLIP(Session):
 
         interface = cast(hislip.Instrument, self.interface)
         # According to IVI-6.1 Rev.2 status query corresponds to viReadSTB.
-        stb = interface.async_status_query()
-        errorcode = StatusCode.success
+        try:
+            stb = interface.async_status_query()
+        except socket.timeout:
+            return 0, StatusCode.error_timeout
+        except hislip.HiSLIPServerError as error:
+            LOGGER.debug("HiSLIP server refused the status query: %s", error)
+            return 0, hislip_error_to_status(error)
+        except hislip.HiSLIPConnectionLost:
+            LOGGER.exception("HiSLIP connection lost during status query")
+            return 0, StatusCode.error_connection_lost
 
-        return stb, errorcode
+        return stb, StatusCode.success
 
     def terminate(self, job_id: VISAJobID | None = None) -> StatusCode:
         """Cancel a pending I/O operation on this session.

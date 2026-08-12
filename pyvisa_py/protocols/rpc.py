@@ -115,6 +115,10 @@ class RPCUnpackError(RPCError):
     pass
 
 
+class RPCConnectionLost(RPCError):
+    """The peer closed the connection while a call was outstanding."""
+
+
 def make_auth_null():
     return b""
 
@@ -355,6 +359,25 @@ def _recvrecord(sock, timeout, read_fun=None, min_packages=0):
             read_data = b""
             if sock in r:
                 read_data = read_fun(exp_length)
+                if not read_data:
+                    # The peer closed the connection. A closed socket stays
+                    # ready for select, so treating this as "nothing yet"
+                    # spins at full CPU until the timeout expires and then
+                    # reports a timeout rather than the lost connection.
+                    if min_packages != 0 and packages_received >= min_packages:
+                        # A server that ends a short reply by closing rather
+                        # than by marking the last fragment. Already handled
+                        # below, so keep that behavior.
+                        LOGGER.debug(
+                            "Connection closed after %i of %i requested packages",
+                            packages_received,
+                            min_packages,
+                        )
+                        return bytes(record)
+                    raise RPCConnectionLost(
+                        "the instrument closed the connection after %d bytes"
+                        % len(record)
+                    )
                 buffer.extend(read_data)
                 LOGGER.debug("received %r" % read_data)
             # Timeout was reached

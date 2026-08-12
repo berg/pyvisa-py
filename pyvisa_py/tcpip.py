@@ -915,12 +915,17 @@ class TCPIPInstrVxi11(Session):
 
         """
         try:
+            send_end, _ = self.get_attribute(ResourceAttribute.send_end_enabled)
+
             flags = 0
             num = len(data)
             offset = 0
 
             while num > 0:
-                if num <= self.max_recv_size:
+                if num <= self.max_recv_size and send_end:
+                    # VXI-11 B.5.3: the end flag asks for the last byte of the
+                    # block to go out with an END indicator, which is what
+                    # VI_ATTR_SEND_END_EN controls.
                     flags |= vxi11.OP_FLAG_END
 
                 block = data[offset : offset + self.max_recv_size]

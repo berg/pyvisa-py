@@ -655,10 +655,16 @@ class TCPIPInstrVxi11(Session):
         self.link = link
         self.max_recv_size = min(max_recv_size, 2**30)  # 1GB
 
+        self._lock_state = constants.VI_NO_LOCK
+
         self.attrs[ResourceAttribute.tcpip_is_hislip] = False
         self.attrs[ResourceAttribute.tcpip_address] = self.parsed.host_address
         self.attrs[ResourceAttribute.tcpip_hostname] = ""
         self.attrs[ResourceAttribute.tcpip_device_name] = self.parsed.lan_device_name
+        self.attrs[ResourceAttribute.resource_lock_state] = (
+            self.get_lock_state,
+            None,
+        )
         for name in ("SEND_END_EN", "TERMCHAR", "TERMCHAR_EN", "SUPPRESS_END_EN"):
             attribute = getattr(constants, "VI_ATTR_" + name)
             self.attrs[attribute] = attributes.AttributesByID[attribute].default
@@ -1145,16 +1151,42 @@ class TCPIPInstrVxi11(Session):
             Return value of the library call.
 
         """
-        #  TODO: lock type not implemented
-        flags = 0
+        # lock_type is not handled. VXI-11 has a single kind of lock, held by
+        # a link, with no key to hand to another session, so a shared lock
+        # cannot be offered as VISA defines it. Requesting one still takes the
+        # device lock, which is what this session did before.
+        if timeout == constants.VI_TMO_IMMEDIATE:
+            # Do not ask the instrument to wait. Without waitlock it answers
+            # error 11 straight away if the device is locked (VXI-11 B.5.3).
+            flags = 0
+            lock_timeout = 0
+        else:
+            # VPP-4.3 3.6.2.1 defines timeout as how long the resource waits
+            # for the lock, so it is the lock_timeout, and waitlock is what
+            # makes the instrument honor it rather than refusing at once.
+            flags = vxi11.OP_FLAG_WAIT_BLOCK
+            lock_timeout = timeout
 
         try:
-            error = self.interface.device_lock(self.link, flags, self.lock_timeout)
+            error = self.interface.device_lock(self.link, flags, lock_timeout)
         except rpc.RPCConnectionLost:
             LOGGER.exception("VXI-11 connection lost while locking")
             return "", StatusCode.error_connection_lost
 
-        return "", vxi11_error_to_status(error)
+        if error == vxi11.ErrorCodes.device_locked_by_another_link and flags:
+            # We asked the instrument to wait and it still could not get the
+            # lock, so lock_timeout elapsed. VPP-4.3 3.6.2.1 calls that
+            # VI_ERROR_TMO. Error 11 without waitlock means the device was
+            # already locked, which is VI_ERROR_RSRC_LOCKED.
+            return "", StatusCode.error_timeout
+
+        status = vxi11_error_to_status(error)
+        if status == StatusCode.success:
+            # Always exclusive: the device lock keeps every other link out,
+            # whichever lock kind the caller asked for.
+            self._lock_state = constants.VI_EXCLUSIVE_LOCK
+
+        return "", status
 
     def unlock(self) -> constants.StatusCode:
         """Relinquish a lock for the specified resource.
@@ -1173,7 +1205,19 @@ class TCPIPInstrVxi11(Session):
             LOGGER.exception("VXI-11 connection lost while unlocking")
             return StatusCode.error_connection_lost
 
-        return vxi11_error_to_status(error)
+        status = vxi11_error_to_status(error)
+        if status == StatusCode.success:
+            self._lock_state = constants.VI_NO_LOCK
+
+        return status
+
+    def get_lock_state(self, attribute: ResourceAttribute) -> Tuple[int, StatusCode]:
+        """Current lock state of this session.
+
+        VPP-4.3 RULE 3.6.2 requires every VISA resource to support
+        VI_ATTR_RSRC_LOCK_STATE.
+        """
+        return self._lock_state, StatusCode.success
 
     def _set_timeout(self, attribute: ResourceAttribute, value: int) -> StatusCode:
         """Sets timeout calculated value from python way to VI_ way"""

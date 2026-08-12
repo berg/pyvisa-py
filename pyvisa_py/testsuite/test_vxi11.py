@@ -7,11 +7,13 @@
 
 import pytest
 
-from pyvisa.constants import StatusCode
+from pyvisa import constants
+from pyvisa.constants import ResourceAttribute, StatusCode
 from pyvisa_py.protocols import vxi11
 from pyvisa_py.tcpip import (
     VXI11_CREATE_LINK_ERRORS_TO_VISA,
     VXI11_ERRORS_TO_VISA,
+    TCPIPInstrVxi11,
     vxi11_create_link_error_to_status,
     vxi11_error_to_status,
 )
@@ -68,3 +70,102 @@ def test_create_link_errors_are_viopen_statuses(error):
 
 def test_unknown_create_link_error_is_still_an_open_failure():
     assert vxi11_create_link_error_to_status(200) is StatusCode.error_resource_not_found
+
+
+class FakeCoreChannel:
+    """Records what device_lock was asked for, and answers as told."""
+
+    def __init__(self, error=0):
+        self.error = error
+        self.calls = []
+
+    def device_lock(self, link, flags, lock_timeout):
+        self.calls.append({"flags": flags, "lock_timeout": lock_timeout})
+        return self.error
+
+    def device_unlock(self, link):
+        return 0
+
+
+def make_session(interface):
+    """A VXI-11 session wired to a fake core channel, without opening one."""
+    session = TCPIPInstrVxi11.__new__(TCPIPInstrVxi11)
+    session.interface = interface
+    session.link = 1
+    session.lock_timeout = 10000
+    session._lock_state = constants.VI_NO_LOCK
+    return session
+
+
+def test_lock_sends_the_callers_timeout():
+    """VPP-4.3 3.6.2.1 defines timeout as how long the resource waits."""
+    channel = FakeCoreChannel()
+    session = make_session(channel)
+
+    session.lock(constants.Lock.exclusive, 3000)
+
+    assert channel.calls[0]["lock_timeout"] == 3000
+
+
+def test_lock_sets_waitlock_so_the_instrument_waits():
+    """VXI-11 B.5.3: without waitlock the server refuses instead of waiting."""
+    channel = FakeCoreChannel()
+    session = make_session(channel)
+
+    session.lock(constants.Lock.exclusive, 3000)
+
+    assert channel.calls[0]["flags"] & vxi11.OP_FLAG_WAIT_BLOCK
+
+
+def test_immediate_lock_does_not_ask_the_instrument_to_wait():
+    channel = FakeCoreChannel()
+    session = make_session(channel)
+
+    session.lock(constants.Lock.exclusive, constants.VI_TMO_IMMEDIATE)
+
+    assert not channel.calls[0]["flags"] & vxi11.OP_FLAG_WAIT_BLOCK
+    assert channel.calls[0]["lock_timeout"] == 0
+
+
+def test_a_lock_that_waited_and_failed_is_a_timeout():
+    """With waitlock set, error 11 means lock_timeout elapsed (RULE B.6.75)."""
+    channel = FakeCoreChannel(error=vxi11.ErrorCodes.device_locked_by_another_link)
+    session = make_session(channel)
+
+    _key, status = session.lock(constants.Lock.exclusive, 3000)
+
+    assert status is StatusCode.error_timeout
+
+
+def test_an_immediate_lock_that_failed_is_reported_as_locked():
+    channel = FakeCoreChannel(error=vxi11.ErrorCodes.device_locked_by_another_link)
+    session = make_session(channel)
+
+    _key, status = session.lock(constants.Lock.exclusive, constants.VI_TMO_IMMEDIATE)
+
+    assert status is StatusCode.error_resource_locked
+
+
+def test_lock_state_follows_lock_and_unlock():
+    """VPP-4.3 RULE 3.6.2 requires every resource to support the attribute."""
+    session = make_session(FakeCoreChannel())
+
+    assert session.get_lock_state(ResourceAttribute.resource_lock_state) == (
+        constants.VI_NO_LOCK,
+        StatusCode.success,
+    )
+
+    session.lock(constants.Lock.exclusive, 3000)
+    assert session._lock_state == constants.VI_EXCLUSIVE_LOCK
+
+    session.unlock()
+    assert session._lock_state == constants.VI_NO_LOCK
+
+
+def test_a_failed_lock_leaves_the_state_alone():
+    channel = FakeCoreChannel(error=vxi11.ErrorCodes.device_locked_by_another_link)
+    session = make_session(channel)
+
+    session.lock(constants.Lock.exclusive, 3000)
+
+    assert session._lock_state == constants.VI_NO_LOCK

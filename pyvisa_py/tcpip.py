@@ -816,14 +816,18 @@ class TCPIPInstrVxi11(Session):
             else:
                 remaining_timeout = constants.VI_TMO_INFINITE  # This is 2**32 - 1
             chunk_timeout = max(10, remaining_timeout)
-            error, reason, data = read_fun(
-                self.link,
-                chunk_length,
-                chunk_timeout,
-                self.lock_timeout,
-                flags,
-                term_char,
-            )
+            try:
+                error, reason, data = read_fun(
+                    self.link,
+                    chunk_length,
+                    chunk_timeout,
+                    self.lock_timeout,
+                    flags,
+                    term_char,
+                )
+            except rpc.RPCConnectionLost:
+                LOGGER.exception("VXI-11 connection lost while reading")
+                return bytes(read_data), StatusCode.error_connection_lost
 
             if error == vxi11.ErrorCodes.io_timeout:
                 return bytes(read_data), StatusCode.error_timeout
@@ -889,6 +893,10 @@ class TCPIPInstrVxi11(Session):
                 num -= size
 
             return offset, StatusCode.success
+
+        except rpc.RPCConnectionLost:
+            LOGGER.exception("VXI-11 connection lost while writing")
+            return 0, StatusCode.error_connection_lost
 
         except vxi11.Vxi11Error:
             return 0, StatusCode.error_timeout
@@ -1010,9 +1018,13 @@ class TCPIPInstrVxi11(Session):
 
         """
         # XXX make this nicer (either validate protocol or pass it)
-        error = self.interface.device_trigger(
-            self.link, 0, self.lock_timeout, self._io_timeout
-        )
+        try:
+            error = self.interface.device_trigger(
+                self.link, 0, self.lock_timeout, self._io_timeout
+            )
+        except rpc.RPCConnectionLost:
+            LOGGER.exception("VXI-11 connection lost while triggering")
+            return StatusCode.error_connection_lost
 
         return VXI11_ERRORS_TO_VISA[error]
 
@@ -1022,9 +1034,13 @@ class TCPIPInstrVxi11(Session):
         Corresponds to viClear function of the VISA library.
 
         """
-        error = self.interface.device_clear(
-            self.link, 0, self.lock_timeout, self._io_timeout
-        )
+        try:
+            error = self.interface.device_clear(
+                self.link, 0, self.lock_timeout, self._io_timeout
+            )
+        except rpc.RPCConnectionLost:
+            LOGGER.exception("VXI-11 connection lost during device clear")
+            return StatusCode.error_connection_lost
 
         return VXI11_ERRORS_TO_VISA[error]
 
@@ -1041,9 +1057,13 @@ class TCPIPInstrVxi11(Session):
             Return value of the library call.
 
         """
-        error, stb = self.interface.device_read_stb(
-            self.link, 0, self.lock_timeout, self._io_timeout
-        )
+        try:
+            error, stb = self.interface.device_read_stb(
+                self.link, 0, self.lock_timeout, self._io_timeout
+            )
+        except rpc.RPCConnectionLost:
+            LOGGER.exception("VXI-11 connection lost during status query")
+            return 0, StatusCode.error_connection_lost
 
         return stb, VXI11_ERRORS_TO_VISA[error]
 
@@ -1082,7 +1102,11 @@ class TCPIPInstrVxi11(Session):
         #  TODO: lock type not implemented
         flags = 0
 
-        error = self.interface.device_lock(self.link, flags, self.lock_timeout)
+        try:
+            error = self.interface.device_lock(self.link, flags, self.lock_timeout)
+        except rpc.RPCConnectionLost:
+            LOGGER.exception("VXI-11 connection lost while locking")
+            return "", StatusCode.error_connection_lost
 
         return "", VXI11_ERRORS_TO_VISA[error]
 
@@ -1097,7 +1121,11 @@ class TCPIPInstrVxi11(Session):
             Return value of the library call.
 
         """
-        error = self.interface.device_unlock(self.link)
+        try:
+            error = self.interface.device_unlock(self.link)
+        except rpc.RPCConnectionLost:
+            LOGGER.exception("VXI-11 connection lost while unlocking")
+            return StatusCode.error_connection_lost
 
         return VXI11_ERRORS_TO_VISA[error]
 

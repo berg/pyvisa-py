@@ -18,6 +18,10 @@ PyVISA-py Changelog
   character detection, allowed use of suppress_end_en, corrected timeout handling.
   Closes #608 PR #612
 - Fixed crash on DEVICE_ENABLE_SRQ(off) and accept malformed SRQ packets. Closes #620 PR #621
+- The socket deadline for a VXI-11 call now allows for the timeouts the call
+  itself carries. ``viLock`` and ``viOpen`` send a lock timeout the instrument
+  is entitled to spend, but the socket gave up after a fixed five seconds, so
+  a socket error escaped in place of the instrument's answer. Closes #583
 - A VXI-11 link that the instrument refuses is now reported as a VISA error
   from ``viOpen`` rather than a bare ``Exception``, and the TCP connection is
   closed instead of being left open.

@@ -105,3 +105,43 @@ def test_recvrecord_still_returns_a_complete_record(listening_port):
         assert rpc._recvrecord(client, 10.0) == payload
     finally:
         client.close()
+
+
+class TestCallDeadline:
+    """The socket deadline must not expire before the call's own timeouts.
+
+    The deadline is a backstop for a link that has gone away. The timeouts in
+    the request belong to the instrument, which reports them as error codes.
+    When the socket gave up first, a socket error escaped in place of the
+    instrument's answer. See pyvisa-py issue #583.
+    """
+
+    deadline_for = staticmethod(rpc.RawTCPClient.call_deadline)
+
+    def test_device_lock_allows_for_its_lock_timeout(self):
+        """device_lock carries only a lock timeout, and used to get neither."""
+        # (link, flags, lock_timeout)
+        assert self.deadline_for(18, (1, 0, 30000)) > 30.0
+
+    def test_create_link_allows_for_its_lock_timeout(self):
+        # (client_id, lock_device, lock_timeout, device)
+        assert self.deadline_for(10, (1, 0, 10000, "inst0")) > 10.0
+
+    def test_read_allows_for_both_timeouts(self):
+        # (link, request_size, io_timeout, lock_timeout, flags, term_char)
+        assert self.deadline_for(12, (1, 1024, 5000, 10000, 0, 0)) > 15.0
+
+    def test_generic_operations_allow_for_both_timeouts(self):
+        # (link, flags, lock_timeout, io_timeout)
+        for proc in (13, 14, 15, 16, 17):
+            assert self.deadline_for(proc, (1, 0, 10000, 5000)) > 15.0
+
+    def test_procedure_without_timeouts_uses_the_default(self):
+        assert self.deadline_for(23, 1) == (
+            rpc.DEFAULT_RPC_TIMEOUT + rpc.RPC_TIMEOUT_MARGIN
+        )
+
+    @pytest.mark.parametrize("proc,indices", sorted(rpc.VXI11_TIMEOUT_ARGS.items()))
+    def test_timeout_indices_are_distinct(self, proc, indices):
+        io_index, lock_index = indices
+        assert io_index != lock_index

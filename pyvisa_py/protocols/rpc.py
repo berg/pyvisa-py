@@ -480,36 +480,74 @@ def _connect(sock, host, port, timeout=0):
         select_timout = max(select_timout / 2.0, min_select_timeout)
 
 
+#: Margin over a call's own timeouts, so the socket never times out first.
+RPC_TIMEOUT_MARGIN = 1.0
+
+#: Deadline for the procedures B.6 gives no timeout, kept above VISA's 2 s default.
+DEFAULT_RPC_TIMEOUT = 4.0
+
+#: Where each VXI-11 procedure carries its timeouts, as indices into the
+#: argument tuple: (io_timeout, lock_timeout). None means the procedure does
+#: not carry that timeout. The layouts are the argument structures in
+#: VXI-11 B.6, and the procedure numbers are the ones in pyvisa_py.protocols
+#: .vxi11, which this module cannot import because vxi11 imports it.
+#:
+#: lock_timeout counts even when the call is not asking to wait for a lock.
+#: A conformant server ignores locks unless the request says otherwise
+#: (B.5.3 waitlock, and B.6.6 for create_link), so on that server the extra
+#: budget is never spent. It is here because a server that does block anyway
+#: is exactly the case that used to fail: the client gave up before the
+#: deadline it had itself sent, and a socket error escaped in place of the
+#: instrument's answer. See pyvisa-py issue #583.
+VXI11_TIMEOUT_ARGS = {
+    10: (None, 2),  # create_link
+    11: (1, 2),  # device_write
+    12: (2, 3),  # device_read
+    13: (3, 2),  # device_readstb
+    14: (3, 2),  # device_trigger
+    15: (3, 2),  # device_clear
+    16: (3, 2),  # device_remote
+    17: (3, 2),  # device_local
+    18: (None, 2),  # device_lock
+    22: (2, 3),  # device_docmd
+}
+
+
 class RawTCPClient(Client):
     """Client using TCP to a specific port."""
 
     def __init__(self, host, prog, vers, port, open_timeout=None):
         Client.__init__(self, host, prog, vers, port)
         self.connect(connect_timeout(open_timeout))
-        # self.timeout defaults higher than the default 2 second VISA timeout,
-        # ensuring that VISA timeouts take precedence.
-        self.timeout = 4.0
+        # Higher than the default 2 second VISA timeout, so that VISA timeouts
+        # take precedence until make_call sets a deadline for the call at hand.
+        self.timeout = DEFAULT_RPC_TIMEOUT
+
+    @staticmethod
+    def call_deadline(proc, args):
+        """Seconds to allow the socket for one call to ``proc``.
+
+        The deadline is a backstop for a link that has gone away, not a way to
+        enforce the timeouts. Those belong to the instrument, which reports
+        them as error codes. Allowing slightly longer than the budget the call
+        itself asked for keeps the two from racing.
+        """
+        io_index, lock_index = VXI11_TIMEOUT_ARGS.get(proc, (None, None))
+
+        if io_index is None and lock_index is None:
+            budget = DEFAULT_RPC_TIMEOUT
+        else:
+            budget = 0.0
+            if io_index is not None:
+                budget += args[io_index] / 1000.0
+            if lock_index is not None:
+                budget += args[lock_index] / 1000.0
+
+        return budget + RPC_TIMEOUT_MARGIN
 
     def make_call(self, proc, args, pack_func, unpack_func):
-        """Overridden to allow for utilizing io_timeout (passed in args)."""
-        if proc == 11:
-            # vxi11.DEVICE_WRITE
-            self.timeout = args[1] / 1000.0
-        elif proc in (12, 22):
-            # vxi11.DEVICE_READ or vxi11.DEVICE_DOCMD
-            self.timeout = args[2] / 1000.0
-        elif proc in (13, 14, 15, 16, 17):
-            # vxi11.DEVICE_READSTB, vxi11.DEVICE_TRIGGER, vxi11.DEVICE_CLEAR,
-            # vxi11.DEVICE_REMOTE, or vxi11.DEVICE_LOCAL
-            self.timeout = args[3] / 1000.0
-        else:
-            self.timeout = 4.0
-
-        # In case of a timeout because the instrument cannot answer, the
-        # instrument should let use something went wrong. If we hit the hard
-        # timeout of the rpc, it means something worse happened (cable
-        # unplugged).
-        self.timeout += 1.0
+        """Overridden to derive the socket deadline from the call's timeouts."""
+        self.timeout = self.call_deadline(proc, args)
 
         return super(RawTCPClient, self).make_call(proc, args, pack_func, unpack_func)
 

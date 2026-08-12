@@ -4,6 +4,11 @@ PyVISA-py Changelog
 0.9.0 (unreleased)
 ------------------
 
+- ``viLock`` on a VXI-11 resource now asks the instrument to wait, and waits
+  for the caller's timeout rather than a fixed ten seconds. Without the
+  waitlock flag a conformant instrument refuses at once, so the timeout could
+  never elapse. ``VI_ATTR_RSRC_LOCK_STATE`` is also reported, as VPP-4.3
+  RULE 3.6.2 requires of every resource. Closes #583
 - The socket deadline for a VXI-11 call now allows for the timeouts the call
   itself carries. ``viLock`` and ``viOpen`` send a lock timeout the instrument
   is entitled to spend, but the socket gave up after a fixed five seconds, so

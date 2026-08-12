@@ -4,6 +4,10 @@ PyVISA-py Changelog
 0.9.0 (unreleased)
 ------------------
 
+- A VXI-11 instrument that closes the connection is now reported as
+  VI_ERROR_CONN_LOST straight away. A closed socket stays ready for select,
+  so the receive loop ran at full CPU until the VISA timeout expired and then
+  reported a timeout.
 - Opening a VXI-11 resource whose instrument is unreachable now fails with a
   VISA error rather than BrokenPipeError. A refused connection makes the
   socket ready for select, which was taken for a completed connection, so the

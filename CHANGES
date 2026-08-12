@@ -4,6 +4,9 @@ PyVISA-py Changelog
 0.9.0 (unreleased)
 ------------------
 
+- A VXI-11 link that the instrument refuses is now reported as a VISA error
+  from ``viOpen`` rather than a bare ``Exception``, and the TCP connection is
+  closed instead of being left open.
 - VXI-11 error codes that are not in the conversion table no longer raise
   KeyError out of the VISA call. They are reported as VI_ERROR_IO. Error 21,
   invalid address, is defined by VXI-11 B.5.2 and was missing from the table;

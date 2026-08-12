@@ -66,6 +66,29 @@ VXI11_ERRORS_TO_VISA = {
 }
 
 
+#: Conversion between the create_link error codes and VISA status.
+#:
+#: VXI-11 B.6.1 Table B.4 lists what create_link can return, and VPP-4.3
+#: viOpen lists the statuses that operation is allowed to report. The two do
+#: not meet through VXI11_ERRORS_TO_VISA, which maps codes for operations on
+#: an established link: VI_ERROR_CONN_LOST and VI_ERROR_IO are not viOpen
+#: statuses.
+VXI11_CREATE_LINK_ERRORS_TO_VISA = {
+    1: StatusCode.error_invalid_resource_name,  # syntax_error
+    3: StatusCode.error_resource_not_found,  # device_not_accessible
+    9: StatusCode.error_allocation,  # out_of_resources
+    11: StatusCode.error_resource_locked,  # device_locked_by_another_link
+    21: StatusCode.error_resource_not_found,  # invalid_address
+}
+
+
+def vxi11_create_link_error_to_status(error: int) -> StatusCode:
+    """Map a create_link error onto a status viOpen is allowed to report."""
+    return VXI11_CREATE_LINK_ERRORS_TO_VISA.get(
+        error, StatusCode.error_resource_not_found
+    )
+
+
 def vxi11_error_to_status(error: int) -> StatusCode:
     """Map a VXI-11 error code onto a VISA status code.
 
@@ -576,7 +599,18 @@ class TCPIPInstrVxi11(Session):
         )
 
         if error:
-            raise Exception("error creating link: %d" % error)
+            # The socket is ours and nothing else will close it, since the
+            # session is never handed back to the caller.
+            self.interface.close()
+            self.interface = None
+            LOGGER.error(
+                "Failed to create a VXI-11 link to %s on port %s: error %d (%s)",
+                host_address,
+                port,
+                error,
+                vxi11_create_link_error_to_status(error).name,
+            )
+            raise OpenError(vxi11_create_link_error_to_status(error))
 
         self.link = link
         self.max_recv_size = min(max_recv_size, 2**30)  # 1GB

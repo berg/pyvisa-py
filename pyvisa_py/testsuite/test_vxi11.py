@@ -9,7 +9,12 @@ import pytest
 
 from pyvisa.constants import StatusCode
 from pyvisa_py.protocols import vxi11
-from pyvisa_py.tcpip import VXI11_ERRORS_TO_VISA, vxi11_error_to_status
+from pyvisa_py.tcpip import (
+    VXI11_CREATE_LINK_ERRORS_TO_VISA,
+    VXI11_ERRORS_TO_VISA,
+    vxi11_create_link_error_to_status,
+    vxi11_error_to_status,
+)
 
 
 @pytest.mark.parametrize("error", sorted(VXI11_ERRORS_TO_VISA))
@@ -40,3 +45,26 @@ def test_invalid_address_is_mapped():
 
 def test_error_codes_enum_covers_the_status_table():
     assert {int(code) for code in vxi11.ErrorCodes} == set(VXI11_ERRORS_TO_VISA)
+
+
+@pytest.mark.parametrize("error", sorted(VXI11_CREATE_LINK_ERRORS_TO_VISA))
+def test_create_link_errors_are_viopen_statuses(error):
+    """viOpen may only report the statuses VPP-4.3 lists for it.
+
+    VXI11_ERRORS_TO_VISA maps codes for operations on an established link, so
+    it produces VI_ERROR_CONN_LOST and VI_ERROR_IO, neither of which viOpen is
+    allowed to return.
+    """
+    allowed = {
+        StatusCode.error_invalid_resource_name,
+        StatusCode.error_resource_not_found,
+        StatusCode.error_allocation,
+        StatusCode.error_resource_busy,
+        StatusCode.error_resource_locked,
+        StatusCode.error_timeout,
+    }
+    assert vxi11_create_link_error_to_status(error) in allowed
+
+
+def test_unknown_create_link_error_is_still_an_open_failure():
+    assert vxi11_create_link_error_to_status(200) is StatusCode.error_resource_not_found

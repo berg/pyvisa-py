@@ -4,6 +4,10 @@ PyVISA-py Changelog
 0.9.0 (unreleased)
 ------------------
 
+- Opening a VXI-11 resource whose instrument is unreachable now fails with a
+  VISA error rather than BrokenPipeError. A refused connection makes the
+  socket ready for select, which was taken for a completed connection, so the
+  failure only surfaced on the first send.
 - Set the TCP keepalive probe timers defensively for all TCPIP resources.
   ``VI_ATTR_TCPIP_KEEPALIVE`` raised ``AttributeError`` on platforms without
   ``socket.TCP_KEEPIDLE``, which includes macOS.

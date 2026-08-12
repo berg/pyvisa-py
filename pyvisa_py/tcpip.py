@@ -60,9 +60,21 @@ VXI11_ERRORS_TO_VISA = {
     12: StatusCode.error_session_not_locked,  # no_lock_held_by_this_link
     15: StatusCode.error_timeout,  # io_timeout
     17: StatusCode.error_io,  # io_error
+    21: StatusCode.error_resource_not_found,  # invalid_address
     23: StatusCode.error_abort,  # abort
     29: StatusCode.error_window_already_mapped,  # channel_already_established
 }
+
+
+def vxi11_error_to_status(error: int) -> StatusCode:
+    """Map a VXI-11 error code onto a VISA status code.
+
+    VXI-11 B.5.2 Table B.2 lists the defined codes, which are the keys of
+    VXI11_ERRORS_TO_VISA. A server can still answer with a code outside that
+    table. Report those as VI_ERROR_IO instead of raising KeyError out of the
+    VISA call.
+    """
+    return VXI11_ERRORS_TO_VISA.get(error, StatusCode.error_io)
 
 
 @Session.register(constants.InterfaceType.tcpip, "INSTR")
@@ -1026,7 +1038,7 @@ class TCPIPInstrVxi11(Session):
             LOGGER.exception("VXI-11 connection lost while triggering")
             return StatusCode.error_connection_lost
 
-        return VXI11_ERRORS_TO_VISA[error]
+        return vxi11_error_to_status(error)
 
     def clear(self) -> StatusCode:
         """Clears a device.
@@ -1042,7 +1054,7 @@ class TCPIPInstrVxi11(Session):
             LOGGER.exception("VXI-11 connection lost during device clear")
             return StatusCode.error_connection_lost
 
-        return VXI11_ERRORS_TO_VISA[error]
+        return vxi11_error_to_status(error)
 
     def read_stb(self) -> Tuple[int, StatusCode]:
         """Reads a status byte of the service request.
@@ -1065,7 +1077,7 @@ class TCPIPInstrVxi11(Session):
             LOGGER.exception("VXI-11 connection lost during status query")
             return 0, StatusCode.error_connection_lost
 
-        return stb, VXI11_ERRORS_TO_VISA[error]
+        return stb, vxi11_error_to_status(error)
 
     def lock(
         self,
@@ -1108,7 +1120,7 @@ class TCPIPInstrVxi11(Session):
             LOGGER.exception("VXI-11 connection lost while locking")
             return "", StatusCode.error_connection_lost
 
-        return "", VXI11_ERRORS_TO_VISA[error]
+        return "", vxi11_error_to_status(error)
 
     def unlock(self) -> constants.StatusCode:
         """Relinquish a lock for the specified resource.
@@ -1127,7 +1139,7 @@ class TCPIPInstrVxi11(Session):
             LOGGER.exception("VXI-11 connection lost while unlocking")
             return StatusCode.error_connection_lost
 
-        return VXI11_ERRORS_TO_VISA[error]
+        return vxi11_error_to_status(error)
 
     def _set_timeout(self, attribute: ResourceAttribute, value: int) -> StatusCode:
         """Sets timeout calculated value from python way to VI_ way"""

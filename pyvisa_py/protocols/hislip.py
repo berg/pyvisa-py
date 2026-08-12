@@ -131,6 +131,14 @@ class HiSLIPInterruptedError(Exception):
         super().__init__(f"HiSLIP I/O terminated (message_id={message_id:#x})")
 
 
+class HiSLIPConnectionLost(RuntimeError):
+    """Raised when the server closes a HiSLIP connection unexpectedly.
+
+    Derives from ``RuntimeError`` to stay catchable by code written against
+    the bare ``RuntimeError`` this module used to raise.
+    """
+
+
 class CancellableSocket(socket.socket):
     """Socket subclass that supports cross-thread cancellation via select().
 
@@ -242,7 +250,7 @@ def receive_exact_into(sock: socket.socket, recv_buffer: MutableBytesBuffer) -> 
         request_size = recv_len - bytes_recvd
         data_len = sock.recv_into(view, request_size)
         if data_len == 0:
-            raise RuntimeError("Connection was dropped by server.")
+            raise HiSLIPConnectionLost("Connection was dropped by server.")
         bytes_recvd += data_len
         view = view[data_len:]
 

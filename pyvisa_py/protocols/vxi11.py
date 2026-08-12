@@ -76,6 +76,7 @@ class ErrorCodes(enum.IntEnum):
     no_lock_held_by_this_link     = 12
     io_timeout                    = 15
     io_error                      = 17
+    invalid_address               = 21
     abort                         = 23
     channel_already_established   = 29
 

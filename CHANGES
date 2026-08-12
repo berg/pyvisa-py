@@ -35,6 +35,9 @@ PyVISA-py Changelog
   VISA error rather than an OSError. A refused connection makes the socket
   ready for select, which was taken for a completed connection, so the failure
   only surfaced on the first send.
+- A HiSLIP instrument that closes the connection is now reported as
+  ``VI_ERROR_CONN_LOST``, and other socket failures as ``VI_ERROR_IO``,
+  rather than letting a ``RuntimeError`` or ``OSError`` escape the VISA call.
 - Set the TCP keepalive probe timers defensively for all TCPIP resources.
   ``VI_ATTR_TCPIP_KEEPALIVE`` raised ``AttributeError`` on platforms without
   ``socket.TCP_KEEPIDLE``, which includes macOS.

@@ -336,6 +336,14 @@ class TCPIPInstrHiSLIP(Session):
         except socket.timeout:
             data, status = b"", StatusCode.error_timeout
 
+        except hislip.HiSLIPConnectionLost:
+            LOGGER.exception("HiSLIP connection lost while reading")
+            data, status = b"", StatusCode.error_connection_lost
+
+        except OSError:
+            LOGGER.exception("Failed to read from the HiSLIP connection")
+            data, status = b"", StatusCode.error_io
+
         return data, status
 
     def write(self, data: bytes) -> Tuple[int, StatusCode]:
@@ -356,7 +364,16 @@ class TCPIPInstrHiSLIP(Session):
             Return value of the library call.
 
         """
-        self.interface.send(data)
+        try:
+            self.interface.send(data)
+        except socket.timeout:
+            return 0, StatusCode.error_timeout
+        except hislip.HiSLIPConnectionLost:
+            LOGGER.exception("HiSLIP connection lost while writing")
+            return 0, StatusCode.error_connection_lost
+        except OSError:
+            LOGGER.exception("Failed to write to the HiSLIP connection")
+            return 0, StatusCode.error_io
 
         return len(data), StatusCode.success
 
